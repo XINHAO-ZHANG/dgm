@@ -37,6 +37,14 @@ sudo usermod -aG docker $USER
 newgrp docker
 ```
 
+HPC login nodes that have Apptainer (or Singularity) and no Docker daemon use the same evaluation entry points. `DGM_CONTAINER_RUNTIME=auto` selects Apptainer when `docker info` fails. See [APPTAINER.md](APPTAINER.md) for a user-local install such as `~/software/apptainer` on bach4.
+
+```bash
+export PATH="$HOME/software/apptainer/bin:$PATH"
+export DGM_CONTAINER_RUNTIME=apptainer
+python scripts/container_smoke.py
+```
+
 ```bash
 # Install dependencies
 python3 -m venv venv

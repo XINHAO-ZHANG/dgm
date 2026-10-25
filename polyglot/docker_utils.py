@@ -175,6 +175,31 @@ def cleanup_container(client, container, logger):
         )
 
 
+def _apptainer_exec_run_with_timeout(container, cmd, timeout: int | None = 60):
+    """Run a command inside an Apptainer sandbox, bounded by coreutils ``timeout``.
+
+    Exit code 124 means the timeout fired. The child is killed by ``timeout``
+    itself, so this does not need docker-py ``exec_create`` / ``exec_inspect``.
+    """
+    import shlex
+
+    if isinstance(cmd, list):
+        cmd_str = " ".join(shlex.quote(str(part)) for part in cmd)
+    else:
+        cmd_str = str(cmd)
+    if timeout is not None and timeout > 0:
+        cmd_str = f"timeout {int(timeout)} {cmd_str}"
+    start_time = time.time()
+    result = container.exec_run(cmd_str, workdir="/")
+    output = result.output if isinstance(result.output, bytes) else b""
+    if isinstance(output, (bytes, bytearray)):
+        text = output.decode("utf-8", errors="replace")
+    else:
+        text = str(output)
+    timed_out = result.exit_code == 124
+    return text, timed_out, time.time() - start_time
+
+
 def exec_run_with_timeout(container, cmd, timeout: int|None=60):
     """
     Run a command in a container with a timeout.
@@ -184,6 +209,14 @@ def exec_run_with_timeout(container, cmd, timeout: int|None=60):
         cmd (str): Command to run.
         timeout (int): Timeout in seconds.
     """
+    try:
+        from utils.apptainer_compat import ApptainerContainer
+    except Exception:
+        class ApptainerContainer:  # type: ignore
+            pass
+    if isinstance(container, ApptainerContainer):
+        return _apptainer_exec_run_with_timeout(container, cmd, timeout)
+
     # Local variables to store the result of executing the command
     exec_result = b''
     exec_id = None

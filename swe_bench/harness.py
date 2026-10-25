@@ -4,7 +4,6 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-import docker
 from datasets import load_dataset
 
 from prompts.testrepo_prompt import get_test_description
@@ -20,6 +19,7 @@ from swe_bench.utils import (
     setup_logger,
 )
 from utils.common_utils import load_json_file
+from utils.docker_utils import docker_from_env
 
 def process_entry(entry, out_dname, model_name_or_path, model_patch_paths):
     """
@@ -40,7 +40,7 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths):
 
     try:
         # Create and start the Docker container
-        client = docker.from_env()
+        client = docker_from_env()
         run_id = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         # Set up thread-specific logger
         logger = setup_logger(str(out_dname / f"{instance_id}_docker.log"))
@@ -222,7 +222,7 @@ def harness(
         entries = entries[:num_samples]
 
     # Build the environment images
-    client = docker.from_env()
+    client = docker_from_env()
     build_env_images(client, dataset=entries, force_rebuild=False, max_workers=max_workers)
     
     # Define a function to handle a single evaluation for all specified issues

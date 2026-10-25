@@ -1,10 +1,12 @@
 import io
 import logging
+import os
 import threading
 from pathlib import Path
 import tarfile
 from typing import Optional, Union
-import docker
+
+from utils import apptainer_errors as container_errors
 
 # Thread-local storage for loggers
 _thread_local = threading.local()
@@ -67,10 +69,10 @@ def remove_existing_container(client, container_name):
         safe_log(f"Removing existing container with name {container_name}")
         existing_container.stop()
         existing_container.remove()
-    except docker.errors.NotFound:
+    except container_errors.NotFound:
         # Container does not exist, no action needed
         safe_log(f"No existing container with name {container_name} found.")
-    except docker.errors.APIError as e:
+    except container_errors.APIError as e:
         safe_log(f"Error removing existing container {container_name}: {e}", logging.ERROR)
         raise
 
@@ -114,8 +116,18 @@ def build_dgm_container(
     try:
         # Build the Docker image if force_rebuild is set or the image doesn't exist
         if force_rebuild or not any(image.tags for image in client.images.list() if image_name in image.tags):
-            safe_log("Building the Docker image...")
-            image, logs = client.images.build(path=repo_path, tag=image_name, rm=True)
+            safe_log("Building the container image...")
+            build_kwargs = dict(path=repo_path, tag=image_name, rm=True)
+            # Apptainer SIFs have no layer cache. nocache rebuilds the .sif.
+            # Docker keeps its own layer cache unless the caller asks otherwise.
+            if force_rebuild:
+                try:
+                    from utils.apptainer_compat import ApptainerClient
+                    if isinstance(client, ApptainerClient):
+                        build_kwargs["nocache"] = True
+                except Exception:
+                    pass
+            image, logs = client.images.build(**build_kwargs)
             for log_entry in logs:
                 if 'stream' in log_entry:
                     safe_log(log_entry['stream'].strip())
@@ -275,3 +287,28 @@ def log_container_output(exec_result):
         error_msg = f"Script failed with exit code {exec_result.exit_code}"
         safe_log(error_msg, logging.ERROR)
         raise Exception(error_msg)
+
+
+def get_container_api_timeout() -> int:
+    """Client timeout for Apptainer pull and exec. Default 600 seconds.
+
+    Dockerfile image builds use a separate 7200s budget
+    (:func:`utils.apptainer_compat.dockerfile_build_timeout`). Set
+    ``APPTAINER_API_TIMEOUT`` or ``CONTAINER_API_TIMEOUT`` to change this
+    client timeout; when either is set, Dockerfile builds use that value
+    unless ``APPTAINER_BUILD_TIMEOUT`` is set.
+    """
+    return int(os.environ.get("APPTAINER_API_TIMEOUT", os.environ.get("CONTAINER_API_TIMEOUT", "600")))
+
+
+def docker_from_env(timeout: Optional[int] = None):
+    """docker-py client, or an Apptainer facade when no daemon is available.
+
+    See ``DGM_CONTAINER_RUNTIME`` in :mod:`utils.container_runtime`. On the
+    Apptainer path, a missing ``timeout`` becomes :func:`get_container_api_timeout`.
+    """
+    from utils.container_runtime import container_from_env, resolve_container_runtime
+
+    if timeout is None and resolve_container_runtime() == "apptainer":
+        timeout = get_container_api_timeout()
+    return container_from_env(timeout=timeout)

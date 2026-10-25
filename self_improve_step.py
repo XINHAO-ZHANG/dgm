@@ -2,8 +2,6 @@ import argparse
 import datetime
 import json
 import os
-import docker
-
 from llm import create_client, get_response_from_llm, extract_json_between_markers
 from prompts.self_improvement_prompt import get_diagnose_prompt_polyglot, get_diagnose_prompt_swe, get_problem_description_prompt
 from prompts.diagnose_improvement_prompt import get_diagnose_improvement_prompt
@@ -22,6 +20,7 @@ from utils.docker_utils import (
     remove_existing_container,
     setup_logger,
     safe_log,
+    docker_from_env,
 )
 
 dataset = None
@@ -263,7 +262,7 @@ def self_improve(
     # Create and start the Docker container
     image_name = "dgm"
     container_name = f"dgm-container-{run_id}"
-    client = docker.from_env()
+    client = docker_from_env()
     # Remove any existing container with the same name
     remove_existing_container(client, container_name)
     # Now create and start the container

@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 
 def load_predictions(paths):
@@ -80,17 +81,31 @@ def preds_to_jsonl(dname, predictions):
             fh.write(json.dumps(minimal_pred) + "\n")
     return predictions_jsonl
 
+def swebench_eval_argv(root_dir, predictions_jsonl, dataset_name, num_eval_procs, run_id):
+    """Argv for SWE-bench grading.
+
+    Docker keeps the upstream script. Apptainer launches
+    ``swe_bench.run_evaluation_apptainer``, which patches ``docker.from_env``
+    inside that child process before the upstream harness imports it.
+    """
+    from utils.container_runtime import resolve_container_runtime
+
+    common = [
+        "--dataset_name", str(dataset_name),
+        "--predictions_path", str(predictions_jsonl),
+        "--max_workers", str(num_eval_procs),
+        "--run_id", str(run_id),
+    ]
+    if resolve_container_runtime() == "apptainer":
+        return [sys.executable, "-m", "swe_bench.run_evaluation_apptainer", *common]
+    script = os.path.join(root_dir, "swe_bench/SWE-bench/swebench/harness/run_evaluation.py")
+    return [sys.executable, script, *common]
+
+
 def run_evals(predictions_jsonl, run_id, dataset_name, root_dir, output_dir, num_eval_procs=5):
     os.chdir(output_dir)  # switch dir so that things will be saved in the specified output_dir
-    run_evals_cmd = f"""
-python {os.path.join(root_dir, './swe_bench/SWE-bench/swebench/harness/run_evaluation.py')}
-    --dataset_name {dataset_name}
-    --predictions_path {predictions_jsonl}
-    --max_workers {num_eval_procs}
-    --run_id {run_id}
-"""
-    run_evals_cmd = " ".join([line.strip() for line in run_evals_cmd.split() if line.strip()])
-    subprocess.run(run_evals_cmd.split(), check=True)
+    argv = swebench_eval_argv(root_dir, predictions_jsonl, dataset_name, num_eval_procs, run_id)
+    subprocess.run(argv, check=True)
     os.chdir(root_dir)  # switch back to the original directory
 
 def make_report(
