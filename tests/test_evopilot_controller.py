@@ -449,6 +449,20 @@ def test_dry_run_writes_auec_curve_and_can_resume(tmp_path):
     assert after == before
 
 
+def test_second_dry_run_replaces_the_trajectory_file(tmp_path):
+    assert main(["--dry_run", "--output_dir", str(tmp_path), "--max_generation", "1"]) == 0
+    assert main(["--dry_run", "--output_dir", str(tmp_path), "--max_generation", "80"]) == 0
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "evopilot_trajectory.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    bootstraps = [event for event in events if event["event"] == "bootstrap"]
+    assert len(bootstraps) == 1
+    assert events[-1]["cumulative_evaluations"] == 44
+    assert events[0]["cumulative_evaluations"] == 0
+
+
 def test_dry_run_respects_max_generation(tmp_path):
     output = tmp_path / "short"
     assert main(["--dry_run", "--output_dir", str(output), "--max_generation", "1"]) == 0

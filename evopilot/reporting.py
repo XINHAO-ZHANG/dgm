@@ -24,7 +24,11 @@ def flush_run(output_dir: str, controller: RecoveryController, *, mode: str, dis
     os.makedirs(output_dir, exist_ok=True)
     trajectory = os.path.join(output_dir, "evopilot_trajectory.jsonl")
     new_events = controller.ledger.events[controller.flushed_events :]
-    with open(trajectory, "a", encoding="utf-8") as handle:
+    # A new controller has not flushed yet. Replace any leftover file so a
+    # second dry run in the same directory does not concatenate two curves.
+    # Resume loads the file first and sets flushed_events, so it still appends.
+    file_mode = "a" if controller.flushed_events else "w"
+    with open(trajectory, file_mode, encoding="utf-8") as handle:
         for event in new_events:
             handle.write(json.dumps(event, sort_keys=True) + "\n")
     controller.flushed_events = len(controller.ledger.events)
