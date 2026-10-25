@@ -15,6 +15,7 @@ swe_bench/*.json
 evo_expr/
 output_selfimprove/
 output_dgm/
+output_evopilot/
 output_peer_review/
 self_evo.md
 *.ipynb

@@ -76,6 +76,41 @@ python DGM_outer.py
 ```
 By default, outputs will be saved in the `output_dgm/` directory.
 
+Polyglot uses the same entry point:
+
+```bash
+python DGM_outer.py --polyglot
+```
+
+## EvoPilot recovery controller
+
+EvoPilot is an alternate outer loop. It keeps one active agent, a small trusted checkpoint bank (default K=4), and a verify → bounded debug (default R=2) → accept or rollback → replan controller. It does not replace the DGM archive. `DGM_outer.py` is the baseline and is unchanged.
+
+The controller records a compute curve for later AUEC-style analysis: cumulative evaluations, best accepted score, and the score of the agent currently being evolved. Token totals are stored only when a self-improve result actually reports them. A dry run does not invent either benchmark scores or paper metrics.
+
+Smoke path, no API keys and no Docker:
+
+```bash
+python3 EvoPilot_outer.py --dry_run --output_dir /tmp/evopilot_smoke
+python3 -m pytest tests/test_evopilot_controller.py
+```
+
+The smoke command replays a fixed synthetic trace and writes:
+
+- `evopilot_trajectory.jsonl` — one row per bootstrap, verify, accept, debug, rollback, or replan, with cumulative evaluations
+- `evopilot_state.json` — active agent, checkpoint bank, and evolution memory
+- `evopilot_summary.json` — AUEC numbers and an explicit synthetic-run disclaimer
+
+Live Polyglot evolution uses the existing self-improve container and Polyglot harness. It needs the same setup as DGM: `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`, a working Docker daemon, `pip install -r requirements.txt`, and `python -m polyglot.prepare_polyglot_dataset`. Start with one generation; each generation is a full self-modify plus evaluation.
+
+```bash
+python3 EvoPilot_outer.py --benchmark polyglot --max_generation 1 --output_dir output_evopilot/polyglot_smoke
+```
+
+SWE-bench uses `--benchmark swe`. `--shallow_eval` stays on the small subset and does not expand to the medium subset. Resume with `--continue_from output_evopilot/<run_id>` after `evopilot_state.json` exists.
+
+What is still scaffolding, not a paper run: there is no neutralized-initialization ablation, no learned recoverability model, and no claim about Polyglot or SWE-bench scores. Provider token usage is not summed inside DGM's self-improve step, so `cumulative_tokens` stays null unless that field is present on a result. Escalate uses the spread across repeated harness reports when two or more exist for the same candidate; one report is not enough to estimate variance.
+
 ## File Structure
 - `analysis/` scripts used for plotting and analysis
 - `initial/` SWE-bench logs and performance of the initial agent
@@ -87,6 +122,8 @@ By default, outputs will be saved in the `output_dgm/` directory.
 - `tools/` tools available to the foundation models
 - `coding_agent.py` main implementation of the initial coding agent
 - `DGM_outer.py` entry point for running the DGM algorithm
+- `EvoPilot_outer.py` entry point for the EvoPilot recovery controller
+- `evopilot/` controller state, verify policy, checkpoint bank, evolution memory, and AUEC ledger
 
 ## Logs from Experiments
 This [google drive folder](https://drive.google.com/drive/folders/1Kcu9TbIa9Z50pJ7S6hH9omzzD1pxIYZC?usp=sharing) contains all the foundation model output logs from the experiments shown in the paper.
