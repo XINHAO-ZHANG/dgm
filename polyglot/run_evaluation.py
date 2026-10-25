@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import docker
+from utils.docker_utils import docker_from_env
 import json
 import resource
 import traceback
@@ -241,7 +242,7 @@ def run_instances(
         run_id (str): Run ID
         timeout (int): Timeout for running tests
     """
-    client = docker.from_env()
+    client = docker_from_env()
     test_specs = list(map(make_test_spec, instances))
 
     # print number of existing instance images
@@ -503,7 +504,7 @@ def main(
     # set open file limit
     assert len(run_id) > 0, "Run ID must be provided"
     resource.setrlimit(resource.RLIMIT_NOFILE, (open_file_limit, open_file_limit))
-    client = docker.from_env()
+    client = docker_from_env()
 
     # load predictions as map of instance_id to prediction
     if predictions_path == 'gold':

@@ -25,3 +25,6 @@ polyglot/predictions/
 
 final_results/
 analysis/output/
+
+# Apptainer SIF cache (local or HPC). Do not commit images.
+apptainer_images/

@@ -7,7 +7,6 @@ from enum import Enum
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-import docker
 from datasets import load_dataset
 
 from prompts.testrepo_prompt import get_test_description
@@ -15,6 +14,7 @@ from polyglot.test_spec import make_test_spec
 from polyglot.docker_build import build_env_images, build_container, cleanup_container
 from polyglot.constants import MAP_REPO_VERSION_TO_SPECS, TEST_COMMANDS
 from utils.git_utils import filter_patch_by_files, remove_patch_by_files
+from utils.docker_utils import docker_from_env
 
 from swe_bench.utils import (
     copy_to_container,
@@ -50,7 +50,7 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths):
 
     try:
         # Create and start the Docker container
-        client = docker.from_env()
+        client = docker_from_env()
         run_id = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         # Set up thread-specific logger
         logger = setup_logger(str(out_dname / f"{instance_id}_docker.log"))
@@ -291,7 +291,7 @@ def harness(
         entries = entries[:num_samples]
 
     # Build the environment images
-    client = docker.from_env()
+    client = docker_from_env()
     build_env_images(client, dataset=entries, max_workers=max_workers, force_rebuild=False)
     
     # Define a function to handle a single evaluation for all specified issues
