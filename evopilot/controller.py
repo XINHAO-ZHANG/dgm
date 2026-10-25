@@ -15,6 +15,7 @@ from evopilot.memory import EvolutionMemory
 from evopilot.metrics import ComputeLedger
 from evopilot.policy import VerifyPolicy
 from evopilot.replan import build_replan_context
+from evopilot.scoring import align_verification
 from evopilot.stagnation import detect_stagnation
 from evopilot.types import (
     AgentSnapshot,
@@ -402,10 +403,13 @@ class RecoveryController:
         evidence = replace(
             evidence,
             base_agent_id=origin.agent_id,
-            base_score=origin.score,
             lineage_id=evidence.lineage_id or self.lineage_id,
             n_evaluations=max(0, int(evidence.n_evaluations)),
         )
+        if evidence.score_protocol:
+            evidence = align_verification(evidence, origin)
+        else:
+            evidence = replace(evidence, base_score=origin.score)
         previous = self._last_evidence
         if (
             previous is not None

@@ -107,7 +107,7 @@ Live Polyglot evolution uses the existing self-improve container and Polyglot ha
 python3 EvoPilot_outer.py --benchmark polyglot --max_generation 1 --output_dir output_evopilot/polyglot_smoke
 ```
 
-SWE-bench uses `--benchmark swe`. `--shallow_eval` stays on the small subset and does not expand to the medium subset. Resume with `--continue_from output_evopilot/<run_id>` after `evopilot_state.json` exists.
+SWE-bench uses `--benchmark swe`. Accept and rollback compare accuracy on one fixed problem set: `small.json` with `--shallow_eval`, otherwise the union of `small.json` and `medium.json`. The cached full-suite accuracy is rescaled onto that set from per-problem results; it is not compared directly with a subset score. `--eval_threshold` does not switch the set. Resume with `--continue_from output_evopilot/<run_id>` after `evopilot_state.json` exists.
 
 What is still scaffolding, not a paper run: there is no neutralized-initialization ablation, no learned recoverability model, and no claim about Polyglot or SWE-bench scores. Provider token usage is not summed inside DGM's self-improve step, so `cumulative_tokens` stays null unless that field is present on a result. Escalate uses the spread across repeated harness reports when two or more exist for the same candidate; one report is not enough to estimate variance.
 

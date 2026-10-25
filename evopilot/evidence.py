@@ -12,6 +12,7 @@ import os
 import statistics
 from dataclasses import replace
 
+from evopilot.scoring import partition
 from evopilot.types import AgentSnapshot, VerificationEvidence
 
 
@@ -129,6 +130,7 @@ def evidence_from_dgm_metadata(
     already_counted_evaluations: int = 0,
     catastrophic_drop: float = 0.2,
     change_intent: str = "",
+    protocol_ids: tuple[str, ...] | None = None,
 ) -> VerificationEvidence:
     perf = metadata.get("overall_performance") or {}
     deep = metadata.get("overall_performance_deep") or {}
@@ -136,44 +138,72 @@ def evidence_from_dgm_metadata(
         perf = {}
     if not isinstance(deep, dict):
         deep = {}
-    score_source = deep if deep.get("accuracy_score") is not None else perf
-    score = score_source.get("accuracy_score") if score_source else None
-    if score is not None:
-        score = float(score)
-
-    resolved = tuple(score_source.get("total_resolved_ids") or perf.get("total_resolved_ids") or ())
-    unresolved = tuple(score_source.get("total_unresolved_ids") or perf.get("total_unresolved_ids") or ())
-    empty = tuple(score_source.get("total_emptypatch_ids") or perf.get("total_emptypatch_ids") or ())
-    submitted = int(perf.get("total_submitted_instances") or 0) + int(deep.get("total_submitted_instances") or 0)
+    protocol = tuple(protocol_ids or ())
+    protocol_mismatch = False
+    if protocol:
+        score_source, resolved, unresolved, empty, missing = _protocol_block(perf, deep, protocol)
+        base_resolved, _, _, base_missing = partition(
+            base.resolved_ids,
+            base.unresolved_ids,
+            base.empty_patch_ids,
+            protocol,
+        )
+        if missing or base_missing:
+            protocol_mismatch = True
+            score = None
+            base_score = base.score
+        else:
+            score = len(resolved) / len(protocol)
+            base_score = len(base_resolved) / len(protocol)
+        submitted = int((score_source or {}).get("total_submitted_instances") or 0)
+    else:
+        score_source = deep if deep.get("accuracy_score") is not None else perf
+        score = score_source.get("accuracy_score") if score_source else None
+        if score is not None:
+            score = float(score)
+        base_score = base.score
+        resolved = tuple(score_source.get("total_resolved_ids") or perf.get("total_resolved_ids") or ())
+        unresolved = tuple(score_source.get("total_unresolved_ids") or perf.get("total_unresolved_ids") or ())
+        empty = tuple(score_source.get("total_emptypatch_ids") or perf.get("total_emptypatch_ids") or ())
+        submitted = int(perf.get("total_submitted_instances") or 0) + int(deep.get("total_submitted_instances") or 0)
     patch_nonempty = bool(metadata.get("model_patch_notempty"))
     has_score = score is not None
     compiled = patch_nonempty and has_score and (len(resolved) + len(unresolved) > 0)
 
-    lost = [item for item in base.resolved_ids if item in unresolved or item in empty]
-    regression = bool(lost) or (compiled and score is not None and score < base.score - 1e-12)
+    lost = [item for item in base.resolved_ids if item in set(unresolved) or item in set(empty)]
+    if protocol:
+        lost = [item for item in lost if item in protocol]
+    regression = (not protocol_mismatch) and (
+        bool(lost) or (compiled and score is not None and score < base_score - 1e-12)
+    )
     entry = metadata.get("entry")
     if entry and (entry in resolved or entry in unresolved or entry in empty):
         resolved_target: bool | None = entry in resolved
     else:
         resolved_target = None
 
-    drop = (base.score - score) if (compiled and score is not None) else 0.0
-    structural = bool(metadata.get("evopilot_structural")) or (compiled and drop >= catastrophic_drop)
-    cluster = failure_cluster_for(
-        compiled=compiled,
-        structural=structural and not metadata.get("evopilot_failure_cluster"),
-        lost=lost,
-        resolved_target=resolved_target,
-        entry=entry if isinstance(entry, str) else None,
-        score=score,
-        base_score=base.score,
-        override=metadata.get("evopilot_failure_cluster"),
+    drop = (base_score - score) if (compiled and score is not None) else 0.0
+    structural = bool(metadata.get("evopilot_structural")) or (
+        compiled and not protocol_mismatch and drop >= catastrophic_drop
     )
-    local_error = (not structural) and (
+    if protocol_mismatch and not metadata.get("evopilot_failure_cluster"):
+        cluster = "incomparable_protocol"
+    else:
+        cluster = failure_cluster_for(
+            compiled=compiled,
+            structural=structural and not metadata.get("evopilot_failure_cluster"),
+            lost=lost,
+            resolved_target=resolved_target,
+            entry=entry if isinstance(entry, str) else None,
+            score=score,
+            base_score=base_score,
+            override=metadata.get("evopilot_failure_cluster"),
+        )
+    local_error = (not structural) and (not protocol_mismatch) and (
         not compiled
         or regression
         or resolved_target is False
-        or (score is not None and score <= base.score + 1e-12)
+        or (score is not None and score <= base_score + 1e-12)
     )
     files: tuple[str, ...] = ()
     if patch_path and os.path.exists(patch_path):
@@ -198,7 +228,7 @@ def evidence_from_dgm_metadata(
     return VerificationEvidence(
         candidate_id=str(metadata.get("run_id") or "unknown"),
         base_agent_id=base.agent_id,
-        base_score=base.score,
+        base_score=base_score,
         candidate_score=score,
         compiled=compiled,
         regression=regression,
@@ -220,7 +250,40 @@ def evidence_from_dgm_metadata(
         escalations_used=escalations_used,
         lineage_id=lineage_id,
         notes=notes,
+        score_protocol=protocol,
+        protocol_mismatch=protocol_mismatch,
     )
+
+
+def _protocol_block(
+    perf: dict,
+    deep: dict,
+    protocol: tuple[str, ...],
+) -> tuple[dict, tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Pick the report whose id lists cover ``protocol``, if one does.
+
+    ``overall_performance`` is preferred so a small-subset report is not
+    replaced by a later medium report that uses a different denominator.
+    """
+
+    best: tuple[dict, tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]] | None = None
+    for block in (perf, deep):
+        if not block:
+            continue
+        resolved, unresolved, empty, missing = partition(
+            block.get("total_resolved_ids") or (),
+            block.get("total_unresolved_ids") or (),
+            block.get("total_emptypatch_ids") or (),
+            protocol,
+        )
+        choice = (block, resolved, unresolved, empty, missing)
+        if not missing:
+            return choice
+        if best is None or len(missing) < len(best[-1]):
+            best = choice
+    if best is None:
+        return {}, (), (), (), protocol
+    return best
 
 
 def with_escalation_fallback(evidence: VerificationEvidence) -> VerificationEvidence:

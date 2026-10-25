@@ -92,6 +92,10 @@ class VerificationEvidence:
     escalations_used: int = 0
     lineage_id: str = ""
     notes: str = ""
+    # Problems both scores must cover. Empty means the caller already
+    # supplied comparable floats (the dry-run fixtures do this).
+    score_protocol: tuple[str, ...] = ()
+    protocol_mismatch: bool = False
 
 
 @dataclass

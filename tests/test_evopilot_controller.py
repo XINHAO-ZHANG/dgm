@@ -12,7 +12,8 @@ from pathlib import Path
 import pytest
 
 import EvoPilot_outer
-from EvoPilot_outer import call_self_improve, main
+from EvoPilot_outer import build_evidence, call_self_improve, main, snapshot_from_initial_metadata
+from evopilot.scoring import evaluation_protocol
 from evopilot.bank import CheckpointBank, RecoverabilityWeights, recoverability_score
 from evopilot.controller import RecoveryController
 from evopilot.evidence import evidence_from_dgm_metadata, parse_diff_paths
@@ -500,3 +501,192 @@ def test_dgm_outer_baseline_is_untouched():
 
 def test_outer_module_imports_without_the_live_stack():
     assert callable(EvoPilot_outer.main)
+
+
+def _protocol_metadata(protocol, resolved, accuracy_score):
+    resolved_set = set(resolved)
+    return {
+        "run_id": "child",
+        "entry": protocol[0],
+        "model_patch_notempty": True,
+        "overall_performance": {
+            "accuracy_score": accuracy_score,
+            "total_submitted_instances": len(protocol),
+            "total_resolved_ids": list(resolved),
+            "total_unresolved_ids": [item for item in protocol if item not in resolved_set],
+            "total_emptypatch_ids": [],
+        },
+    }
+
+
+def test_full_suite_baseline_is_not_compared_with_a_subset_score():
+    """2/10 = 0.20 beats a full-suite 0.142 and still is not an improvement.
+
+    The cached initial agent resolves 2 of the 10 small Polyglot tasks, so
+    its comparable accuracy is 0.20. A candidate with the same two resolves
+    must not be accepted, including when its report claims a higher
+    ``accuracy_score`` than the id lists support. One extra resolve on that
+    same set must be accepted even if the report's raw fraction is 0.142.
+    """
+
+    small = json.loads(Path("polyglot/subsets/small.json").read_text(encoding="utf-8"))
+    medium = json.loads(Path("polyglot/subsets/medium.json").read_text(encoding="utf-8"))
+    shallow = evaluation_protocol(small, medium, shallow=True)
+    wide = evaluation_protocol(small, medium, shallow=False)
+    assert len(shallow) == 10
+    assert set(wide) == set(small) | set(medium)
+    assert len(wide) == len(set(wide))
+
+    initial = snapshot_from_initial_metadata("initial_polyglot/metadata.json", shallow)
+    full = json.loads(Path("initial_polyglot/metadata.json").read_text(encoding="utf-8"))
+    full_score = full["overall_performance"]["accuracy_score"]
+    assert full_score == pytest.approx(0.142)
+    assert initial.score == pytest.approx(0.2)
+    assert initial.score > full_score
+    covered = set(initial.resolved_ids) | set(initial.unresolved_ids) | set(initial.empty_patch_ids)
+    assert covered == set(shallow)
+
+    wide_initial = snapshot_from_initial_metadata("initial_polyglot/metadata.json", wide)
+    assert wide_initial.score == pytest.approx(9 / 59)
+    assert wide_initial.score != pytest.approx(full_score)
+
+    # The unaligned comparison is the bug: 0.20 > 0.142 accepts.
+    naive = VerifyPolicy().decide(
+        VerificationEvidence(
+            candidate_id="naive",
+            base_agent_id="initial",
+            base_score=full_score,
+            candidate_score=0.20,
+            compiled=True,
+            regression=False,
+            structural_error=False,
+            local_error=False,
+            resolved_target=None,
+            failure_cluster="ok",
+            change_intent="subset edit",
+            targeted_failure_mode=shallow[0],
+        )
+    )
+    assert naive[0] == Decision.ACCEPT
+
+    controller = RecoveryController()
+    controller.bootstrap(initial)
+    same = _protocol_metadata(shallow, initial.resolved_ids, accuracy_score=0.99)
+    built = build_evidence(
+        same,
+        controller,
+        debug_round=0,
+        escalations_used=0,
+        already_counted=0,
+        patch_path=None,
+        protocol_ids=shallow,
+    )
+    assert built.base_score == pytest.approx(0.2)
+    assert built.candidate_score == pytest.approx(0.2)
+    assert built.protocol_mismatch is False
+    held = controller.step(built)
+    assert held.decision != Decision.ACCEPT
+    assert controller.active.score == pytest.approx(0.2)
+
+    # The controller also ignores a lying candidate_score when the protocol is set.
+    controller = RecoveryController()
+    controller.bootstrap(
+        AgentSnapshot(
+            agent_id="initial",
+            parent_id=None,
+            score=full_score,
+            step=0,
+            resolved_ids=tuple(full["overall_performance"]["total_resolved_ids"]),
+            unresolved_ids=tuple(full["overall_performance"]["total_unresolved_ids"]),
+            empty_patch_ids=tuple(full["overall_performance"]["total_emptypatch_ids"]),
+            root=True,
+        )
+    )
+    lying = evidence(
+        controller,
+        candidate_score=0.20,
+        base_score=full_score,
+        score_protocol=shallow,
+        resolved_ids=tuple(initial.resolved_ids),
+        unresolved_ids=tuple(initial.unresolved_ids),
+        empty_patch_ids=tuple(initial.empty_patch_ids),
+        regression=False,
+        failure_cluster="ok",
+        resolved_target=None,
+    )
+    blocked = controller.step(lying)
+    assert blocked.decision != Decision.ACCEPT
+    assert controller.ledger.events[-1]["candidate_score"] == pytest.approx(0.2)
+    assert controller.ledger.events[-1]["details"]["reason"] != "score_improves_without_regression"
+
+    extras = list(initial.unresolved_ids) + list(initial.empty_patch_ids)
+    assert extras
+    gained = list(initial.resolved_ids) + [extras[0]]
+    improved = _protocol_metadata(shallow, gained, accuracy_score=full_score)
+    controller = RecoveryController()
+    controller.bootstrap(initial)
+    accepted = controller.step(
+        build_evidence(
+            improved,
+            controller,
+            debug_round=0,
+            escalations_used=0,
+            already_counted=0,
+            patch_path=None,
+            protocol_ids=shallow,
+        )
+    )
+    assert accepted.decision == Decision.ACCEPT
+    assert accepted.active.score == pytest.approx(0.3)
+    assert accepted.active.score != pytest.approx(full_score)
+    stored = set(accepted.active.resolved_ids) | set(accepted.active.unresolved_ids) | set(accepted.active.empty_patch_ids)
+    assert stored == set(shallow)
+
+    partial = _protocol_metadata(shallow, initial.resolved_ids, accuracy_score=0.90)
+    mismatched = controller.step(
+        build_evidence(
+            partial,
+            controller,
+            debug_round=0,
+            escalations_used=0,
+            already_counted=0,
+            patch_path=None,
+            protocol_ids=wide,
+        )
+    )
+    assert mismatched.decision == Decision.ROLLBACK
+    assert mismatched.reason == "incomparable_evaluation_protocol"
+    assert controller.active.score == pytest.approx(0.3)
+    assert controller.best_score == pytest.approx(0.3)
+
+
+def test_incomplete_baseline_cache_is_not_scored_with_the_full_suite_fraction(tmp_path):
+    path = tmp_path / "metadata.json"
+    path.write_text(
+        json.dumps(
+            {
+                "overall_performance": {
+                    "accuracy_score": 0.9,
+                    "total_resolved_ids": ["a"],
+                    "total_unresolved_ids": [],
+                    "total_emptypatch_ids": [],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="full-suite"):
+        snapshot_from_initial_metadata(str(path), ("a", "b"))
+
+    small = json.loads(Path("swe_bench/subsets/small.json").read_text(encoding="utf-8"))
+    medium = json.loads(Path("swe_bench/subsets/medium.json").read_text(encoding="utf-8"))
+    shallow = snapshot_from_initial_metadata(
+        "initial/metadata.json",
+        evaluation_protocol(small, medium, shallow=True),
+    )
+    assert shallow.score == pytest.approx(0.3)
+    with pytest.raises(RuntimeError, match="no cached result"):
+        snapshot_from_initial_metadata(
+            "initial/metadata.json",
+            evaluation_protocol(small, medium, shallow=False),
+        )

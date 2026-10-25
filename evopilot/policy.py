@@ -32,6 +32,8 @@ class VerifyPolicy:
     def decide(self, evidence: VerificationEvidence) -> tuple[Decision, str]:
         if evidence.structural_error or self._catastrophic(evidence):
             return Decision.ROLLBACK, "structural_or_catastrophic_regression"
+        if evidence.protocol_mismatch:
+            return Decision.ROLLBACK, "incomparable_evaluation_protocol"
         if not evidence.compiled:
             if self._can_debug(evidence):
                 return Decision.DEBUG, "uncompiled_candidate_within_budget"

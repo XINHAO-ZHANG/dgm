@@ -27,6 +27,7 @@ from evopilot.evidence import evidence_from_dgm_metadata, with_escalation_fallba
 from evopilot.policy import VerifyPolicy
 from evopilot.replan import format_debug_statement, format_improve_suffix
 from evopilot.reporting import flush_run, load_run
+from evopilot.scoring import evaluation_protocol, partition
 from evopilot.smoke import DRY_RUN_DISCLAIMER, run_smoke
 from evopilot.types import AgentSnapshot, Decision, VerificationEvidence
 from utils.common_utils import load_json_file
@@ -49,8 +50,17 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--continue_from", type=str, default=None, help="Resume a previous EvoPilot output directory.")
     parser.add_argument("--num_evals", type=int, default=1, help="Repeated evaluations passed through to self_improve.")
-    parser.add_argument("--shallow_eval", action="store_true", help="Do not expand from the small subset to the medium subset.")
-    parser.add_argument("--eval_threshold", type=float, default=0.4, help="Resolved-rate gate for the medium subset.")
+    parser.add_argument(
+        "--shallow_eval",
+        action="store_true",
+        help="Score every accept and rollback on small.json only. The default protocol is small.json plus medium.json.",
+    )
+    parser.add_argument(
+        "--eval_threshold",
+        type=float,
+        default=0.4,
+        help="Kept so existing commands still parse. The accept set does not depend on this threshold.",
+    )
     parser.add_argument(
         "--post_improve_diagnose",
         action="store_true",
@@ -83,17 +93,39 @@ def prepare_initial_copy(output_dir: str, benchmark: str) -> None:
     shutil.copytree(source, destination)
 
 
-def snapshot_from_initial_metadata(path: str) -> AgentSnapshot:
+def snapshot_from_initial_metadata(path: str, protocol_ids: tuple[str, ...] | list[str]) -> AgentSnapshot:
+    """Baseline accuracy on ``protocol_ids``, using cached per-problem results.
+
+    The stored full-suite ``accuracy_score`` is not used. A cache that has
+    no result for any protocol problem is refused, so a live run cannot
+    start from an incomparable denominator.
+    """
+
     metadata = load_json_file(path)
     perf = metadata.get("overall_performance") or {}
+    protocol = tuple(protocol_ids)
+    if not protocol:
+        raise RuntimeError("The evaluation protocol is empty.")
+    resolved, unresolved, empty, missing = partition(
+        perf.get("total_resolved_ids") or (),
+        perf.get("total_unresolved_ids") or (),
+        perf.get("total_emptypatch_ids") or (),
+        protocol,
+    )
+    if missing:
+        sample = ", ".join(missing[:3])
+        raise RuntimeError(
+            f"{path} has no cached result for {len(missing)} problems in the evaluation protocol ({sample}). "
+            "Refusing to fall back to the full-suite accuracy."
+        )
     return AgentSnapshot(
         agent_id="initial",
         parent_id=None,
-        score=float(perf.get("accuracy_score") or 0.0),
+        score=len(resolved) / len(protocol),
         step=0,
-        resolved_ids=tuple(perf.get("total_resolved_ids") or ()),
-        unresolved_ids=tuple(perf.get("total_unresolved_ids") or ()),
-        empty_patch_ids=tuple(perf.get("total_emptypatch_ids") or ()),
+        resolved_ids=resolved,
+        unresolved_ids=unresolved,
+        empty_patch_ids=empty,
         root=True,
     )
 
@@ -136,7 +168,7 @@ def call_self_improve(**kwargs):
         return failure_metadata(kwargs.get("parent_commit", "initial"), kwargs.get("entry"), exc)
 
 
-def build_evidence(metadata: dict, controller: RecoveryController, *, debug_round: int, escalations_used: int, already_counted: int, patch_path: str | None) -> VerificationEvidence:
+def build_evidence(metadata: dict, controller: RecoveryController, *, debug_round: int, escalations_used: int, already_counted: int, patch_path: str | None, protocol_ids: tuple[str, ...]) -> VerificationEvidence:
     assert controller.active is not None
     return evidence_from_dgm_metadata(
         metadata,
@@ -148,6 +180,7 @@ def build_evidence(metadata: dict, controller: RecoveryController, *, debug_roun
         results_dir=os.path.dirname(patch_path) if patch_path else None,
         already_counted_evaluations=already_counted,
         catastrophic_drop=controller.policy.catastrophic_drop,
+        protocol_ids=protocol_ids,
     )
 
 
@@ -195,6 +228,8 @@ def drive_escalations(controller, evidence, rerun):
 
 def run_live(args: argparse.Namespace, output_dir: str) -> dict:
     os.makedirs(output_dir, exist_ok=True)
+    small, medium = load_task_lists(args.benchmark)
+    protocol = evaluation_protocol(small, medium, shallow=args.shallow_eval)
     state_path = os.path.join(output_dir, "evopilot_state.json")
     if args.continue_from:
         if not os.path.exists(state_path):
@@ -210,10 +245,11 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
             ),
             bank_size=args.bank_size,
         )
-        controller.bootstrap(snapshot_from_initial_metadata(os.path.join(output_dir, "initial", "metadata.json")))
+        controller.bootstrap(
+            snapshot_from_initial_metadata(os.path.join(output_dir, "initial", "metadata.json"), protocol)
+        )
         flush_run(output_dir, controller, mode="live", disclaimer=LIVE_DISCLAIMER)
 
-    small, medium = load_task_lists(args.benchmark)
     polyglot = args.benchmark == "polyglot"
     log_path = os.path.join(output_dir, "evopilot_outer.log")
 
@@ -238,8 +274,6 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
             raise RuntimeError("No task entry is available on the active agent.")
         controller.begin_attempt(f"self-edit targeting {entry}", entry)
         suffix = format_improve_suffix(context)
-        threshold = 0.0 if context.increase_verification else args.eval_threshold
-        more = None if args.shallow_eval else medium
         log(f"generation {controller.generation} improve parent={controller.active.agent_id} entry={entry}")
         metadata = call_self_improve(
             parent_commit=controller.active.agent_id,
@@ -247,9 +281,9 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
             entry=entry,
             num_evals=args.num_evals,
             post_improve_diagnose=args.post_improve_diagnose,
-            test_task_list=small,
-            test_more_threshold=None if args.shallow_eval else threshold,
-            test_task_list_more=more,
+            test_task_list=list(protocol),
+            test_more_threshold=None,
+            test_task_list_more=None,
             full_eval_threshold=None,
             polyglot=polyglot,
             problem_statement_suffix=suffix or None,
@@ -262,15 +296,18 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
             escalations_used=0,
             already_counted=0,
             patch_path=os.path.join(candidate_dir(output_dir, str(metadata.get("run_id"))), "model_patch.diff"),
+            protocol_ids=protocol,
         )
 
         def rerun_fixed(current: VerificationEvidence):
-            if args.shallow_eval or not medium or str(current.candidate_id).startswith("failed"):
+            # A second sample has to use the same problem set. Re-running the
+            # medium subset alone would replace the report and change the denominator.
+            if str(current.candidate_id).startswith("failed"):
                 return None
             counted = submitted_instances(metadata)
             try:
                 updated = reevaluate_candidate(
-                    output_dir, metadata, medium, polyglot=polyglot, num_evals=args.num_evals,
+                    output_dir, metadata, list(protocol), polyglot=polyglot, num_evals=args.num_evals,
                 )
             except Exception as exc:
                 log(f"escalate re-evaluation failed: {exc}")
@@ -282,6 +319,7 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
                 escalations_used=current.escalations_used + 1,
                 already_counted=counted,
                 patch_path=os.path.join(candidate_dir(output_dir, str(updated.get("run_id"))), "model_patch.diff"),
+                protocol_ids=protocol,
             )
 
         result, evidence = drive_escalations(controller, evidence, rerun_fixed)
@@ -299,9 +337,9 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
                 entry=entry,
                 num_evals=args.num_evals,
                 post_improve_diagnose=False,
-                test_task_list=small,
-                test_more_threshold=None if args.shallow_eval else threshold,
-                test_task_list_more=more,
+                test_task_list=list(protocol),
+                test_more_threshold=None,
+                test_task_list_more=None,
                 full_eval_threshold=None,
                 polyglot=polyglot,
                 problem_statement_override=statement,
@@ -314,6 +352,7 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
                 escalations_used=0,
                 already_counted=0,
                 patch_path=os.path.join(candidate_dir(output_dir, str(metadata.get("run_id"))), "model_patch.diff"),
+                protocol_ids=protocol,
             )
             result, evidence = drive_escalations(controller, evidence, rerun_fixed)
         log(
