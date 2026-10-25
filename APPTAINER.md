@@ -37,11 +37,26 @@ mkdir -p "$APPTAINER_IMAGE_DIR" "$APPTAINER_CACHEDIR" "$APPTAINER_WORKSPACE_ROOT
 
 Slurm jobs can source `scripts/slurm/apptainer_runtime.inc.sh`, which sets the same variables (image dir defaults to `./apptainer_images` in the repo, workspace under `$SLURM_TMPDIR` when present).
 
-If `--fakeroot` is unavailable (no subuid mapping), build with:
+## Fakeroot during image builds
+
+`APPTAINER_BUILD_FAKEROOT=1` (the default) passes `--fakeroot` to two build steps:
+
+- the Dockerfile post-script `apptainer exec` that runs `RUN` (apt, conda, rustup, pip)
+- the final `apptainer build` that packs the sandbox into a SIF
+
+`pb.base.x86_64` installs packages as root. Without `--fakeroot` on that exec, apt fails and the build raises `apptainer Dockerfile post script failed`. The post-script stdout and stderr are included in the `BuildError` text and in the docker-py build stream (`build_image.log`).
+
+bach4 has no `/etc/subuid` entry. `apptainer exec --fakeroot` still runs there through Apptainer's root-mapped user namespace: `apptainer exec --fakeroot docker://ubuntu:22.04 id` prints `uid=0`. A missing subuid map is not a reason to disable fakeroot.
+
+Fakeroot also needs libraries inside the image. `ubuntu:22.04` and `buildpack-deps:jammy` (the Polyglot base) work. Alpine does not: `apptainer exec --fakeroot docker://alpine` fails because the image has no fakeroot support library. Keep jammy/Ubuntu bases for images whose `RUN` steps need root.
+
+If fakeroot itself errors, turn it off:
 
 ```bash
 export APPTAINER_BUILD_FAKEROOT=0
 ```
+
+Root package installs in `RUN` then fail unless the base image already contains them.
 
 Unprivileged Apptainer already shares the host network, which `pip` and model API calls need. `APPTAINER_USE_HOST_NETWORK=1` adds `--net --network host` and often needs fakeroot; leave it at `0`.
 

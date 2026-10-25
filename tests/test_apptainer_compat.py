@@ -184,6 +184,7 @@ def test_build_sif_copies_into_workdir(tmp_path, monkeypatch):
             (sandbox / "bin").mkdir(parents=True, exist_ok=True)
         if args[:1] == ["exec"] or (len(args) > 1 and args[0] == "exec"):
             sandbox = Path(args[args.index("bash") - 1])
+            seen["exec_args"] = list(args)
             seen["contain"] = "--contain" in args
             seen["no_mount"] = args[args.index("--no-mount") + 1] == "tmp"
             seen["hello_during_exec"] = (sandbox / "dgm" / "hello.txt").is_file()
@@ -229,9 +230,113 @@ def test_build_sif_copies_into_workdir(tmp_path, monkeypatch):
     assert seen["sandbox_root_intact"] is True
     assert seen["contain"] is True
     assert seen["no_mount"] is True
+    assert "--fakeroot" not in seen["exec_args"]
     assert seen["hello_at_sif"] == "payload"
     assert sif.is_file()
     assert any("Copied . -> /dgm" in entry.get("stream", "") for entry in logs)
+
+
+def _install_build_fakes(monkeypatch, seen):
+    """Sandbox + post-script stand-ins. The final SIF pack writes an empty file."""
+
+    def fake_run(args, timeout=None, check=True):
+        if "--sandbox" in args:
+            sandbox = Path(args[args.index("--sandbox") + 1])
+            (sandbox / "bin").mkdir(parents=True, exist_ok=True)
+            return _completed(args, stdout=b"sandbox\n")
+        if args and args[0] == "exec":
+            seen["exec_args"] = list(args)
+            stdout = seen.get("stdout", b"ok\n")
+            stderr = seen.get("stderr", b"")
+            code = seen.get("code", 0)
+            return _completed(args, code=code, stdout=stdout, stderr=stderr)
+        return _completed(args, stdout=b"ok\n")
+
+    real_popen = subprocess.Popen
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            self._real = None
+            if cmd and cmd[0] != "cp":
+                Path(cmd[-2]).write_bytes(b"sif")
+                self.stdout = io.BytesIO(b"built\n")
+            else:
+                self._real = real_popen(cmd, **kwargs)
+                self.stdout = self._real.stdout
+
+        def wait(self):
+            return self._real.wait() if self._real is not None else 0
+
+        def __enter__(self):
+            return self._real.__enter__() if self._real is not None else self
+
+        def __exit__(self, exc_type, exc, tb):
+            if self._real is not None:
+                return self._real.__exit__(exc_type, exc, tb)
+            return False
+
+    monkeypatch.setattr("utils.apptainer_compat._run_apptainer", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+
+def test_post_script_exec_includes_fakeroot_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPTAINER_BUILD_FAKEROOT", "1")
+    context = tmp_path / "repo"
+    context.mkdir()
+    (context / "Dockerfile").write_text(
+        "FROM buildpack-deps:jammy\nRUN echo hi\n",
+        encoding="utf-8",
+    )
+    seen = {}
+    _install_build_fakes(monkeypatch, seen)
+    sif = tmp_path / "images" / "pb.base.x86_64_latest.sif"
+    _build_sif_from_dockerfile(context, "pb.base.x86_64:latest", sif, timeout=5)
+    args = seen["exec_args"]
+    assert args[0] == "exec"
+    assert "--fakeroot" in args
+    assert args.index("--fakeroot") < args.index(str(Path(args[args.index("bash") - 1])))
+    assert "--writable" in args
+    assert "--contain" in args
+
+
+def test_post_script_failure_includes_stdout_and_stderr(tmp_path, monkeypatch):
+    from utils.apptainer_errors import BuildError
+    from utils.apptainer_compat import ApptainerClient
+
+    monkeypatch.setenv("APPTAINER_BUILD_FAKEROOT", "1")
+    context = tmp_path / "repo"
+    context.mkdir()
+    (context / "Dockerfile").write_text(
+        "FROM buildpack-deps:jammy\nRUN apt-get install -y git\n",
+        encoding="utf-8",
+    )
+    seen = {
+        "code": 100,
+        "stdout": b"Reading package lists...\n",
+        "stderr": b"E: Could not open lock file - are you root?\n",
+    }
+    _install_build_fakes(monkeypatch, seen)
+    sif = tmp_path / "images" / "pb.base.x86_64_latest.sif"
+    with pytest.raises(BuildError) as raised:
+        _build_sif_from_dockerfile(context, "pb.base.x86_64:latest", sif, timeout=5)
+    text = str(raised.value)
+    assert "Could not open lock file" in text
+    assert "Reading package lists" in text
+    assert "Could not open lock file" in raised.value.build_log
+    assert "--fakeroot" in seen["exec_args"]
+
+    client = ApptainerClient(timeout=5)
+
+    def _boom(*_args, **_kwargs):
+        raise raised.value
+
+    monkeypatch.setattr(client.images, "build", _boom)
+    chunks = list(client.api.build(path=str(context), tag="pb.base.x86_64:latest"))
+    streamed = "".join(chunk.get("stream", "") for chunk in chunks)
+    assert "Could not open lock file" in streamed
+    assert "Reading package lists" in streamed
+    assert chunks[-1]["errorDetail"]["message"]
+    assert "Could not open lock file" in chunks[-1]["errorDetail"]["message"]
 
 
 def test_pull_is_locked_and_renames_tmp(tmp_path, monkeypatch):

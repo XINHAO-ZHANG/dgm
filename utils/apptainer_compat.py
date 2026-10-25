@@ -370,6 +370,59 @@ def _exec_prefix() -> List[str]:
     return args
 
 
+def _process_output(proc: subprocess.CompletedProcess) -> str:
+    """Combine stdout and stderr so a failed build log shows the real error."""
+
+    def _decode(buf: Any) -> str:
+        if not buf:
+            return ""
+        if isinstance(buf, str):
+            return buf
+        return bytes(buf).decode("utf-8", errors="replace")
+
+    out = _decode(proc.stdout)
+    err = _decode(proc.stderr)
+    if out and err and err.strip() and err.strip() not in out:
+        if not out.endswith("\n"):
+            out += "\n"
+        return out + err
+    return out or err
+
+
+def _raise_build_failure(message: str, output: str, logs: List[dict]) -> None:
+    text = output or ""
+    if text and not text.endswith("\n"):
+        text += "\n"
+    if text:
+        logs.append({"stream": text})
+    detail = f"{message}\n{text}" if text else message
+    build_log = "".join(entry.get("stream", "") for entry in logs)
+    raise container_errors.BuildError(detail, build_log)
+
+
+def _build_error_stream(exc: BaseException) -> Iterator[dict]:
+    """Turn a BuildError into docker-py build chunks, including captured output."""
+    build_log = getattr(exc, "build_log", "") or ""
+    if isinstance(build_log, bytes):
+        build_log = build_log.decode("utf-8", errors="replace")
+    elif isinstance(build_log, list):
+        parts: List[str] = []
+        for item in build_log:
+            if isinstance(item, dict):
+                parts.append(str(item.get("stream") or item.get("error") or ""))
+            else:
+                parts.append(str(item))
+        build_log = "".join(parts)
+    else:
+        build_log = str(build_log)
+    message = str(getattr(exc, "msg", None) or exc)
+    if build_log:
+        yield {"stream": build_log if build_log.endswith("\n") else build_log + "\n"}
+    elif message:
+        yield {"stream": message if message.endswith("\n") else message + "\n"}
+    yield {"errorDetail": {"message": message}}
+
+
 def _build_sif_from_dockerfile(
     path: Path,
     tag: str,
@@ -415,17 +468,20 @@ def _build_sif_from_dockerfile(
                 timeout=timeout,
                 check=False,
             )
-        logs.append(
-            {
-                "stream": (proc.stdout or proc.stderr or b"").decode(
-                    "utf-8", errors="replace"
-                )
-            }
-        )
+        sandbox_output = _process_output(proc)
         if proc.returncode != 0:
-            raise container_errors.BuildError(
+            _raise_build_failure(
                 f"apptainer sandbox build failed for {tag}",
-                logs[-1]["stream"],
+                sandbox_output,
+                logs,
+            )
+        elif sandbox_output:
+            logs.append(
+                {
+                    "stream": sandbox_output
+                    if sandbox_output.endswith("\n")
+                    else sandbox_output + "\n"
+                }
             )
 
         for src, dest in copy_steps:
@@ -449,19 +505,28 @@ def _build_sif_from_dockerfile(
         post_path.write_text("\n".join(post_lines), encoding="utf-8")
         if run_lines or env_lines:
             logs.append({"stream": "Running Dockerfile post script in sandbox\n"})
-            exec_args = _exec_prefix() + [str(sandbox), "bash", "/dockerfile-post.sh"]
+            # RUN steps (apt, conda, rustup, pip) install as root. --fakeroot maps
+            # the caller to uid 0 inside the sandbox. On hosts without /etc/subuid
+            # this still works via Apptainer's root-mapped user namespace.
+            exec_args = _exec_prefix()
+            if _use_fakeroot_build():
+                exec_args = exec_args[:1] + ["--fakeroot"] + exec_args[1:]
+            exec_args = exec_args + [str(sandbox), "bash", "/dockerfile-post.sh"]
             proc = _run_apptainer(exec_args, timeout=timeout, check=False)
-            logs.append(
-                {
-                    "stream": (proc.stdout or proc.stderr or b"").decode(
-                        "utf-8", errors="replace"
-                    )
-                }
-            )
+            post_output = _process_output(proc)
             if proc.returncode != 0:
-                raise container_errors.BuildError(
+                _raise_build_failure(
                     f"apptainer Dockerfile post script failed for {tag}",
-                    logs[-1]["stream"],
+                    post_output,
+                    logs,
+                )
+            elif post_output:
+                logs.append(
+                    {
+                        "stream": post_output
+                        if post_output.endswith("\n")
+                        else post_output + "\n"
+                    }
                 )
 
         if env_lines:
@@ -1059,9 +1124,16 @@ class ApptainerClientAPI:
         platform: Optional[str] = None,
         nocache: bool = False,
     ) -> Iterator[dict]:
-        _image, logs = self._client.images.build(
-            path=path, tag=tag, rm=rm, nocache=nocache
-        )
+        try:
+            _image, logs = self._client.images.build(
+                path=path, tag=tag, rm=rm, nocache=nocache
+            )
+        except container_errors.BuildError as exc:
+            # docker-py's low-level build API yields a log stream, then an
+            # errorDetail chunk. polyglot/docker_build.py writes those chunks
+            # to build_image.log; a raised BuildError alone only keeps str(exc).
+            yield from _build_error_stream(exc)
+            return
         yield from logs
 
     def inspect_container(self, container_id: str) -> dict:
