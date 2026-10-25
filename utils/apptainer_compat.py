@@ -387,12 +387,42 @@ def dockerfile_build_timeout(client_timeout: Optional[int] = None) -> int:
 
 
 def _exec_prefix() -> List[str]:
+    """Flags for a running eval container.
+
+    ``--contain`` isolates host ``$HOME`` and the default ``/tmp`` mount.
+    That is correct for grading (``/tmp/patch.diff`` must stay in the sandbox)
+    and wrong for Dockerfile ``RUN`` steps: with ``--fakeroot``, ``--contain``
+    mounts an empty directory over ``/root`` and hides ``COPY`` destinations
+    such as ``/root/setup_env.sh``.
+    """
     args = ["exec", "--writable"]
     if _contain_enabled():
         args.append("--contain")
     no_mount = _no_mount_spec()
     if no_mount:
         args.extend(["--no-mount", no_mount])
+    return args
+
+
+def _post_script_exec_args(sandbox: Path) -> List[str]:
+    """Flags for the Dockerfile post script inside the build sandbox.
+
+    Do not pass ``--contain``. Fakeroot's home is ``/root``; ``--contain``
+    replaces it with an empty mount, so ``chmod /root/setup_env.sh`` fails
+    even though the file is in the sandbox. ``--no-home`` and
+    ``--no-mount tmp,home,cwd`` leave sandbox ``/root`` and ``/tmp`` in place
+    (rustup and conda write under ``/root``; ``ADD`` writes ``/tmp/rustup.sh``).
+    """
+    args = [
+        "exec",
+        "--writable",
+        "--no-home",
+        "--no-mount",
+        "tmp,home,cwd",
+    ]
+    if _use_fakeroot_build():
+        args.insert(1, "--fakeroot")
+    args.extend([str(sandbox), "bash", "/dockerfile-post.sh"])
     return args
 
 
@@ -534,10 +564,9 @@ def _build_sif_from_dockerfile(
             # RUN steps (apt, conda, rustup, pip) install as root. --fakeroot maps
             # the caller to uid 0 inside the sandbox. On hosts without /etc/subuid
             # this still works via Apptainer's root-mapped user namespace.
-            exec_args = _exec_prefix()
-            if _use_fakeroot_build():
-                exec_args = exec_args[:1] + ["--fakeroot"] + exec_args[1:]
-            exec_args = exec_args + [str(sandbox), "bash", "/dockerfile-post.sh"]
+            # Flags differ from runtime exec: no --contain, so /root stays the
+            # sandbox directory that COPY just filled.
+            exec_args = _post_script_exec_args(sandbox)
             proc = _run_apptainer(exec_args, timeout=timeout, check=False)
             post_output = _process_output(proc)
             if proc.returncode != 0:

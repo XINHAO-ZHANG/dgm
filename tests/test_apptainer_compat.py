@@ -186,7 +186,8 @@ def test_build_sif_copies_into_workdir(tmp_path, monkeypatch):
             sandbox = Path(args[args.index("bash") - 1])
             seen["exec_args"] = list(args)
             seen["contain"] = "--contain" in args
-            seen["no_mount"] = args[args.index("--no-mount") + 1] == "tmp"
+            seen["no_home"] = "--no-home" in args
+            seen["no_mount"] = "tmp" in args[args.index("--no-mount") + 1].split(",")
             seen["hello_during_exec"] = (sandbox / "dgm" / "hello.txt").is_file()
             seen["sandbox_root_intact"] = (sandbox / "bin").is_dir()
         return _completed(args, stdout=b"ok\n")
@@ -228,7 +229,8 @@ def test_build_sif_copies_into_workdir(tmp_path, monkeypatch):
     logs = _build_sif_from_dockerfile(context, "dgm", sif, timeout=5)
     assert seen["hello_during_exec"] is True
     assert seen["sandbox_root_intact"] is True
-    assert seen["contain"] is True
+    assert seen["contain"] is False
+    assert seen["no_home"] is True
     assert seen["no_mount"] is True
     assert "--fakeroot" not in seen["exec_args"]
     assert seen["hello_at_sif"] == "payload"
@@ -299,7 +301,9 @@ def test_post_script_exec_includes_fakeroot_when_enabled(tmp_path, monkeypatch):
     assert "--fakeroot" in args
     assert args.index("--fakeroot") < args.index(str(Path(args[args.index("bash") - 1])))
     assert "--writable" in args
-    assert "--contain" in args
+    assert "--no-home" in args
+    assert "--contain" not in args
+    assert "home" in args[args.index("--no-mount") + 1].split(",")
     assert seen["post_timeout"] == 5
     assert seen["sif_wait_timeout"] == 5
 
@@ -335,6 +339,62 @@ def test_dockerfile_build_defaults_to_7200_seconds(tmp_path, monkeypatch):
     assert seen["sandbox_timeout"] == 7200
     assert seen["post_timeout"] == 7200
     assert seen["sif_wait_timeout"] == 7200
+
+
+def test_copy_into_root_stays_visible_to_post_script(tmp_path, monkeypatch):
+    """pb.env COPY ./setup_env.sh /root/ must still be there for the RUN chmod.
+
+    Production post-script flags must not include --contain, which mounts an
+    empty directory over fakeroot's /root and hides the copied file.
+    """
+    monkeypatch.setenv("APPTAINER_BUILD_FAKEROOT", "1")
+    monkeypatch.setenv("APPTAINER_CONTAIN", "1")
+    context = tmp_path / "env"
+    context.mkdir()
+    (context / "setup_env.sh").write_text("#!/bin/bash\necho setup\n", encoding="utf-8")
+    (context / "Dockerfile").write_text(
+        "FROM pb.base.x86_64:latest\n"
+        "COPY ./setup_env.sh /root/\n"
+        "RUN chmod +x /root/setup_env.sh && /root/setup_env.sh\n",
+        encoding="utf-8",
+    )
+    seen = {}
+    _install_build_fakes(monkeypatch, seen)
+
+    def fake_run(args, timeout=None, check=True):
+        if "--sandbox" in args:
+            sandbox = Path(args[args.index("--sandbox") + 1])
+            (sandbox / "bin").mkdir(parents=True, exist_ok=True)
+            return _completed(args, stdout=b"sandbox\n")
+        if args and args[0] == "exec":
+            sandbox = Path(args[args.index("bash") - 1])
+            script = sandbox / "root" / "setup_env.sh"
+            seen["exec_args"] = list(args)
+            seen["setup_env_visible"] = script.is_file()
+            seen["setup_env_text"] = script.read_text(encoding="utf-8") if script.is_file() else ""
+            post = (sandbox / "dockerfile-post.sh").read_text(encoding="utf-8")
+            seen["post_mentions_chmod"] = "chmod +x /root/setup_env.sh" in post
+            return _completed(args, stdout=b"ok\n")
+        return _completed(args, stdout=b"ok\n")
+
+    # Replace only the runner; keep the SIF-pack Popen fake installed above.
+    monkeypatch.setattr("utils.apptainer_compat._run_apptainer", fake_run)
+    sif = tmp_path / "images" / "pb.env.x86_64.ce9e95520b42abb86d1825_latest.sif"
+    _build_sif_from_dockerfile(
+        context, "pb.env.x86_64.ce9e95520b42abb86d1825:latest", sif, timeout=5
+    )
+    args = seen["exec_args"]
+    assert seen["setup_env_visible"] is True
+    assert "echo setup" in seen["setup_env_text"]
+    assert seen["post_mentions_chmod"] is True
+    assert "--contain" not in args
+    assert "--no-home" in args
+    assert "--writable" in args
+    assert "--fakeroot" in args
+    no_mount = args[args.index("--no-mount") + 1].split(",")
+    assert "tmp" in no_mount
+    assert "home" in no_mount
+    assert args.index("--no-home") < args.index("bash")
 
 
 def test_post_script_failure_includes_stdout_and_stderr(tmp_path, monkeypatch):

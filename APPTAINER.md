@@ -81,7 +81,9 @@ Smoke checks (`ping`, `alpine echo`) do not need this. Set it before Polyglot bu
 
 Unprivileged Apptainer already shares the host network, which `pip` and model API calls need. `APPTAINER_USE_HOST_NETWORK=1` adds `--net --network host` and often needs fakeroot; leave it at `0`.
 
-`APPTAINER_CONTAIN=1` and `APPTAINER_NO_MOUNT=tmp` (the defaults) stop Apptainer from hiding the sandbox `/tmp` and image home with the host's `/tmp` and `$HOME`. Polyglot writes the patch to `/tmp/patch.diff` inside the container. Explicit `APPTAINER_BINDPATH` binds are still applied.
+`APPTAINER_CONTAIN=1` and `APPTAINER_NO_MOUNT=tmp` (the defaults) apply to **running** containers. They stop Apptainer from hiding the sandbox `/tmp` and image home with the host's `/tmp` and `$HOME`. Polyglot writes the patch to `/tmp/patch.diff` inside the container. Explicit `APPTAINER_BINDPATH` binds are still applied.
+
+The Dockerfile post script does **not** use `--contain`. With `--fakeroot`, that flag mounts an empty directory over `/root` and hides files `COPY` just placed there. `pb.env` then fails with `chmod: cannot access '/root/setup_env.sh'`. The post script uses `--writable`, `--no-home`, and `--no-mount tmp,home,cwd` so sandbox `/root` (conda, rustup, `setup_env.sh`) and `/tmp` stay visible. `APPTAINER_CONTAIN` does not change that build step.
 
 ## Smoke test
 
