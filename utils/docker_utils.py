@@ -290,7 +290,14 @@ def log_container_output(exec_result):
 
 
 def get_container_api_timeout() -> int:
-    """Long default for Apptainer image builds. Docker keeps its own client timeout."""
+    """Client timeout for Apptainer pull and exec. Default 600 seconds.
+
+    Dockerfile image builds use a separate 7200s budget
+    (:func:`utils.apptainer_compat.dockerfile_build_timeout`). Set
+    ``APPTAINER_API_TIMEOUT`` or ``CONTAINER_API_TIMEOUT`` to change this
+    client timeout; when either is set, Dockerfile builds use that value
+    unless ``APPTAINER_BUILD_TIMEOUT`` is set.
+    """
     return int(os.environ.get("APPTAINER_API_TIMEOUT", os.environ.get("CONTAINER_API_TIMEOUT", "600")))
 
 

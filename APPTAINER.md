@@ -30,7 +30,10 @@ export APPTAINER_IMAGE_DIR="$HOME/.cache/apptainer/images"
 export APPTAINER_CACHEDIR="$APPTAINER_IMAGE_DIR/cache"
 export APPTAINER_TMPDIR="${TMPDIR:-/tmp}"
 export APPTAINER_WORKSPACE_ROOT="${TMPDIR:-/tmp}/apptainer-workspaces"
+# Client pull/exec timeout. Dockerfile builds default to 7200s on their own;
+# set this as well when you want every Apptainer call on that budget.
 export APPTAINER_API_TIMEOUT=7200
+export APPTAINER_BUILD_TIMEOUT=7200
 
 mkdir -p "$APPTAINER_IMAGE_DIR" "$APPTAINER_CACHEDIR" "$APPTAINER_WORKSPACE_ROOT"
 ```
@@ -58,6 +61,24 @@ export APPTAINER_BUILD_FAKEROOT=0
 
 Root package installs in `RUN` then fail unless the base image already contains them.
 
+## Build timeout
+
+`pb.base.x86_64:latest` runs apt, Go, Rust, npm, and conda in one post script, then `apptainer build --fakeroot` (mksquashfs). That does not finish in 600 seconds. On bach4 the 600s client timeout stopped the post script mid-npm. The same build with a 7200s limit got through conda and into mksquashfs.
+
+Dockerfile builds (sandbox creation, the post script, and the final SIF pack) default to **7200** seconds. `docker_from_env()` still uses **600** seconds for pull and `exec_run` unless you override it. Precedence for the build budget:
+
+| Variable | Effect |
+| --- | --- |
+| `APPTAINER_BUILD_TIMEOUT` | Dockerfile build budget. Recommended **7200** for a full Polyglot base image. |
+| `APPTAINER_API_TIMEOUT` or `CONTAINER_API_TIMEOUT` | Used for builds only when `APPTAINER_BUILD_TIMEOUT` is unset. Also the pull/exec client timeout (default 600 when unset). |
+| neither set | Builds use 7200. Pull and exec stay at 600. |
+
+```bash
+export APPTAINER_BUILD_TIMEOUT=7200
+```
+
+Smoke checks (`ping`, `alpine echo`) do not need this. Set it before Polyglot builds `pb.base.*`.
+
 Unprivileged Apptainer already shares the host network, which `pip` and model API calls need. `APPTAINER_USE_HOST_NETWORK=1` adds `--net --network host` and often needs fakeroot; leave it at `0`.
 
 `APPTAINER_CONTAIN=1` and `APPTAINER_NO_MOUNT=tmp` (the defaults) stop Apptainer from hiding the sandbox `/tmp` and image home with the host's `/tmp` and `$HOME`. Polyglot writes the patch to `/tmp/patch.diff` inside the container. Explicit `APPTAINER_BINDPATH` binds are still applied.
@@ -76,6 +97,8 @@ Pull Alpine and exec (needs network, writes a SIF):
 python scripts/container_smoke.py --exec
 # equivalent to: apptainer exec docker://alpine:latest echo ok
 ```
+
+A full Polyglot base build (`pb.base.x86_64:latest`, apt+go+rust+npm+conda, then mksquashfs) needs `APPTAINER_BUILD_TIMEOUT=7200`. That is the Dockerfile-build default; the Alpine smoke above does not use it.
 
 ## What runs without a Docker daemon
 

@@ -360,6 +360,32 @@ def _dockerfile_env_script(env_lines: List[str]) -> str:
     return "\n".join(lines)
 
 
+# pb.base (apt, Go, Rust, npm, conda, then mksquashfs) does not finish in the
+# 600s client/exec default. Dockerfile builds use this unless overridden.
+_DEFAULT_DOCKERFILE_BUILD_TIMEOUT = 7200
+
+
+def dockerfile_build_timeout(client_timeout: Optional[int] = None) -> int:
+    """Seconds for sandbox build, Dockerfile post-script, and SIF pack.
+
+    ``APPTAINER_BUILD_TIMEOUT`` wins. Otherwise an explicit
+    ``APPTAINER_API_TIMEOUT`` or ``CONTAINER_API_TIMEOUT`` is honored so an
+    operator-chosen budget still applies. With neither set, the default is
+    7200 even when the client exec timeout stays at 600.
+    """
+    if os.environ.get("APPTAINER_BUILD_TIMEOUT"):
+        return int(os.environ["APPTAINER_BUILD_TIMEOUT"])
+    if os.environ.get("APPTAINER_API_TIMEOUT") or os.environ.get("CONTAINER_API_TIMEOUT"):
+        if client_timeout is not None:
+            return int(client_timeout)
+        return int(
+            os.environ.get("APPTAINER_API_TIMEOUT")
+            or os.environ.get("CONTAINER_API_TIMEOUT")
+            or _DEFAULT_DOCKERFILE_BUILD_TIMEOUT
+        )
+    return _DEFAULT_DOCKERFILE_BUILD_TIMEOUT
+
+
 def _exec_prefix() -> List[str]:
     args = ["exec", "--writable"]
     if _contain_enabled():
@@ -549,14 +575,33 @@ def _build_sif_from_dockerfile(
         for line in proc.stdout:
             text = line.decode("utf-8", errors="replace")
             logs.append({"stream": text})
-        if proc.wait() != 0:
-            raise container_errors.BuildError(
-                f"apptainer build failed for {tag}",
-                "".join(entry.get("stream", "") for entry in logs),
-            )
+        _wait_build_process(proc, timeout, tag, logs)
         return logs
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def _wait_build_process(proc: subprocess.Popen, timeout: Optional[int], tag: str, logs: List[dict]) -> None:
+    """Wait for the SIF pack. Kill it if it exceeds the Dockerfile build timeout."""
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        _raise_build_failure(
+            f"apptainer build timed out after {timeout}s for {tag}",
+            "",
+            logs,
+        )
+        return
+    if rc != 0:
+        raise container_errors.BuildError(
+            f"apptainer build failed for {tag}",
+            "".join(entry.get("stream", "") for entry in logs),
+        )
 
 
 def _docker_uri_for_local_tag(image_ref: str) -> str:
@@ -826,9 +871,10 @@ class ApptainerImages:
 
         dockerfile_text = dockerfile.read_text(encoding="utf-8")
         from_ref, _, _, _ = _parse_dockerfile_instructions(dockerfile_text)
+        build_timeout = dockerfile_build_timeout(self._client.timeout)
         if from_ref:
             logs = _build_sif_from_dockerfile(
-                path, tag, sif, timeout=self._client.timeout
+                path, tag, sif, timeout=build_timeout
             )
         else:
             build_args = ["build", "--force"]
@@ -846,11 +892,7 @@ class ApptainerImages:
             for line in proc.stdout:
                 text = line.decode("utf-8", errors="replace")
                 logs.append({"stream": text})
-            if proc.wait() != 0:
-                raise container_errors.BuildError(
-                    f"apptainer build failed for {tag}",
-                    "\n".join(entry.get("stream", "") for entry in logs),
-                )
+            _wait_build_process(proc, build_timeout, tag, logs)
         self._write_meta(sif, [tag])
         return ApptainerImage(tags=[tag], id=sif.stem, attrs={"Created": time.time(), "Id": sif.stem}), logs
 

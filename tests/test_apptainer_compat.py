@@ -207,9 +207,9 @@ def test_build_sif_copies_into_workdir(tmp_path, monkeypatch):
                 self._real = real_popen(cmd, **kwargs)
                 self.stdout = self._real.stdout
 
-        def wait(self):
+        def wait(self, timeout=None):
             if self._real is not None:
-                return self._real.wait()
+                return self._real.wait(timeout=timeout)
             return 0
 
         def __enter__(self):
@@ -243,9 +243,11 @@ def _install_build_fakes(monkeypatch, seen):
         if "--sandbox" in args:
             sandbox = Path(args[args.index("--sandbox") + 1])
             (sandbox / "bin").mkdir(parents=True, exist_ok=True)
+            seen["sandbox_timeout"] = timeout
             return _completed(args, stdout=b"sandbox\n")
         if args and args[0] == "exec":
             seen["exec_args"] = list(args)
+            seen["post_timeout"] = timeout
             stdout = seen.get("stdout", b"ok\n")
             stderr = seen.get("stderr", b"")
             code = seen.get("code", 0)
@@ -264,8 +266,9 @@ def _install_build_fakes(monkeypatch, seen):
                 self._real = real_popen(cmd, **kwargs)
                 self.stdout = self._real.stdout
 
-        def wait(self):
-            return self._real.wait() if self._real is not None else 0
+        def wait(self, timeout=None):
+            seen["sif_wait_timeout"] = timeout
+            return self._real.wait(timeout=timeout) if self._real is not None else 0
 
         def __enter__(self):
             return self._real.__enter__() if self._real is not None else self
@@ -297,6 +300,41 @@ def test_post_script_exec_includes_fakeroot_when_enabled(tmp_path, monkeypatch):
     assert args.index("--fakeroot") < args.index(str(Path(args[args.index("bash") - 1])))
     assert "--writable" in args
     assert "--contain" in args
+    assert seen["post_timeout"] == 5
+    assert seen["sif_wait_timeout"] == 5
+
+
+def test_dockerfile_build_defaults_to_7200_seconds(tmp_path, monkeypatch):
+    from utils.apptainer_compat import ApptainerClient, dockerfile_build_timeout
+
+    monkeypatch.delenv("APPTAINER_BUILD_TIMEOUT", raising=False)
+    monkeypatch.delenv("APPTAINER_API_TIMEOUT", raising=False)
+    monkeypatch.delenv("CONTAINER_API_TIMEOUT", raising=False)
+    assert dockerfile_build_timeout(600) == 7200
+
+    monkeypatch.setenv("APPTAINER_BUILD_TIMEOUT", "9000")
+    assert dockerfile_build_timeout(600) == 9000
+    monkeypatch.delenv("APPTAINER_BUILD_TIMEOUT")
+    monkeypatch.setenv("APPTAINER_API_TIMEOUT", "1800")
+    assert dockerfile_build_timeout(1800) == 1800
+
+    monkeypatch.delenv("APPTAINER_API_TIMEOUT")
+    monkeypatch.delenv("CONTAINER_API_TIMEOUT", raising=False)
+    monkeypatch.setenv("APPTAINER_BUILD_FAKEROOT", "0")
+    context = tmp_path / "repo"
+    context.mkdir()
+    (context / "Dockerfile").write_text(
+        "FROM buildpack-deps:jammy\nRUN echo hi\n",
+        encoding="utf-8",
+    )
+    seen = {}
+    _install_build_fakes(monkeypatch, seen)
+    client = ApptainerClient(timeout=600)
+    assert client.timeout == 600
+    _image, _logs = client.images.build(path=context, tag="pb.base.x86_64:latest")
+    assert seen["sandbox_timeout"] == 7200
+    assert seen["post_timeout"] == 7200
+    assert seen["sif_wait_timeout"] == 7200
 
 
 def test_post_script_failure_includes_stdout_and_stderr(tmp_path, monkeypatch):
