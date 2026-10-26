@@ -28,6 +28,14 @@ export OPENAI_API_KEY='...'
 export ANTHROPIC_API_KEY='...'
 ```
 
+OpenRouter can serve the self-improve diagnose and coding calls. Put the OpenRouter key in `OPENAI_API_KEY` or `OPENROUTER_API_KEY`, and point the OpenAI client at OpenRouter. Default smoke models are `gpt-4o-mini` (chat completions). Anthropic stays optional for that path; non-self-improve SWE solving still uses Claude.
+
+```bash
+export OPENAI_API_KEY='...'          # or OPENROUTER_API_KEY
+export OPENROUTER_API_KEY='...'      # forwarded into the self-improve container
+export OPENAI_BASE_URL='https://openrouter.ai/api/v1'
+```
+
 ```bash
 # Verify that Docker is properly configured in your environment.
 docker run hello-world
@@ -101,7 +109,7 @@ The smoke command replays a fixed synthetic trace and writes:
 - `evopilot_state.json` — active agent, checkpoint bank, and evolution memory
 - `evopilot_summary.json` — AUEC numbers, salvage rate, and an explicit synthetic-run disclaimer
 
-Live Polyglot evolution uses the same self-improve container and Polyglot harness as DGM. It needs `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `pip install -r requirements.txt`, and `python -m polyglot.prepare_polyglot_dataset`. The container runtime follows `DGM_CONTAINER_RUNTIME` (`auto`, `docker`, or `apptainer`). On bach4, select Apptainer. A Docker daemon is not required for that path. Image build and fakeroot notes are in [APPTAINER.md](APPTAINER.md). Start with one generation; each generation is a full self-modify plus evaluation.
+Live Polyglot evolution uses the same self-improve container and Polyglot harness as DGM. It needs an OpenAI-compatible key (`OPENAI_API_KEY` or `OPENROUTER_API_KEY`), `pip install -r requirements.txt`, and `python -m polyglot.prepare_polyglot_dataset`. With `OPENAI_BASE_URL=https://openrouter.ai/api/v1`, diagnose and self-improve use `gpt-4o-mini` and Anthropic is optional. The container runtime follows `DGM_CONTAINER_RUNTIME` (`auto`, `docker`, or `apptainer`). On bach4, select Apptainer. A Docker daemon is not required for that path. Image build and fakeroot notes are in [APPTAINER.md](APPTAINER.md). Start with one generation; each generation is a full self-modify plus evaluation.
 
 ```bash
 export PATH="$HOME/software/apptainer/bin:$PATH"

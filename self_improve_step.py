@@ -24,7 +24,7 @@ from utils.docker_utils import (
 )
 
 dataset = None
-diagnose_model = 'o1-2024-12-17'
+diagnose_model = 'gpt-4o-mini'
 
 def diagnose_problem(entry, commit, root_dir, out_dir, patch_files=[], max_attempts=3, polyglot=False):
     client = create_client(diagnose_model)
@@ -360,6 +360,8 @@ def self_improve(
         "AWS_ACCESS_KEY_ID": os.getenv('AWS_ACCESS_KEY_ID'),
         "AWS_SECRET_ACCESS_KEY": os.getenv('AWS_SECRET_ACCESS_KEY'),
         "OPENAI_API_KEY": os.getenv('OPENAI_API_KEY'),
+        "OPENROUTER_API_KEY": os.getenv('OPENROUTER_API_KEY'),
+        "OPENAI_BASE_URL": os.getenv('OPENAI_BASE_URL'),
     }
     cmd = [
         "timeout", "1800",  # 30min timeout

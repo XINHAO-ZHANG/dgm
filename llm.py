@@ -13,6 +13,7 @@ AVAILABLE_LLMS = [
     "claude-3-5-sonnet-20240620",
     "claude-3-5-sonnet-20241022",
     # OpenAI models
+    "gpt-4o-mini",
     "gpt-4o-mini-2024-07-18",
     "gpt-4o-2024-05-13",
     "gpt-4o-2024-08-06",
@@ -67,7 +68,17 @@ def create_client(model: str):
         return anthropic.AnthropicVertex(), client_model
     elif 'gpt' in model or model.startswith("o1-") or model.startswith("o3-"):
         print(f"Using OpenAI API with model {model}.")
-        return openai.OpenAI(), model
+        # No args: the OpenAI client reads OPENAI_API_KEY and OPENAI_BASE_URL.
+        # OPENROUTER_API_KEY is a fallback so a container that only received
+        # that name still reaches OpenRouter chat completions.
+        kwargs = {}
+        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+        if api_key:
+            kwargs["api_key"] = api_key
+        base_url = os.getenv("OPENAI_BASE_URL")
+        if base_url:
+            kwargs["base_url"] = base_url
+        return openai.OpenAI(**kwargs), model
     elif model.startswith("deepseek-"):
         print(f"Using OpenAI API with {model}.")
         client = openai.OpenAI(
@@ -79,8 +90,9 @@ def create_client(model: str):
         print(f"Using OpenAI API with {model}.")
         client = openai.OpenAI(
             api_key=os.environ["OPENROUTER_API_KEY"],
-            base_url="https://openrouter.ai/api/v1"
-        ), model
+            base_url="https://openrouter.ai/api/v1",
+        )
+        return client, model
     else:
         raise ValueError(f"Model {model} not supported.")
 
