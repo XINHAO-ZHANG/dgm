@@ -6,7 +6,7 @@ import os
 import threading
 
 from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
-from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+from utils.git_utils import diff_versus_commit, reset_to_commit, ensure_trailing_newline, apply_patch
 
 # reset_to_commit(git_dname, commit)
 # apply_patch(git_dname, patch_str)
@@ -179,7 +179,7 @@ def main():
     agentic_system.forward()
 
     # Get code diff and save to model_patch.diff
-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+    model_patch = ensure_trailing_newline(diff_versus_commit(args.git_dir, args.base_commit))
     model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
     with open(model_patch_outfile, 'w') as f:
         f.write(model_patch)

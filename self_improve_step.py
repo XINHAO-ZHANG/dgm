@@ -11,6 +11,7 @@ from polyglot.harness import harness as polyglot_harness
 from swe_bench.report import make_report
 from utils.common_utils import load_json_file
 from utils.evo_utils import get_model_patch_paths, get_all_performance, is_compiled_self_improve
+from utils.git_utils import prepare_model_patch
 from utils.docker_utils import (
     build_dgm_container,
     cleanup_container,
@@ -394,8 +395,36 @@ def self_improve(
                 raise Exception("Model patch file is empty")
     except Exception as e:
         safe_log(f"Failed to read model patch file: {str(e)}")
+        try:
+            cleanup_container(container)
+        except Exception as cleanup_error:
+            safe_log(f"Error cleaning up container after unreadable patch: {cleanup_error}")
         save_metadata(metadata, output_dir)
         return metadata
+
+    fixed_patch, patch_notes = prepare_model_patch(patch_content)
+    metadata.update(patch_notes)
+    if fixed_patch is None:
+        reason = patch_notes.get("model_patch_malformed_reason")
+        safe_log(f"model_patch.diff malformed ({reason}); not starting Verify")
+        metadata["model_patch_exists"] = True
+        metadata["model_patch_notempty"] = bool(patch_content.strip())
+        metadata["model_patch_rejected"] = True
+        try:
+            cleanup_container(container)
+        except Exception as cleanup_error:
+            safe_log(f"Error cleaning up container after malformed patch: {cleanup_error}")
+        save_metadata(metadata, output_dir)
+        return metadata
+    if fixed_patch != patch_content:
+        with open(model_patch_file, 'w', encoding='utf-8') as handle:
+            handle.write(fixed_patch)
+        if patch_notes.get("model_patch_salvaged"):
+            safe_log(
+                "model_patch.diff was malformed "
+                f"({patch_notes.get('model_patch_malformed_reason')}); "
+                "kept complete file diffs and skipped the truncated tail"
+            )
 
     patch_files.append(model_patch_file)
 

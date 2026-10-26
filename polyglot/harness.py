@@ -13,7 +13,12 @@ from prompts.testrepo_prompt import get_test_description
 from polyglot.test_spec import make_test_spec
 from polyglot.docker_build import build_env_images, build_container, cleanup_container
 from polyglot.constants import MAP_REPO_VERSION_TO_SPECS, TEST_COMMANDS
-from utils.git_utils import filter_patch_by_files, remove_patch_by_files
+from utils.git_utils import (
+    ensure_trailing_newline,
+    filter_patch_by_files,
+    preflight_model_patches,
+    remove_patch_by_files,
+)
 from utils.docker_utils import docker_from_env
 
 from swe_bench.utils import (
@@ -256,12 +261,14 @@ def harness(
         model_patch_paths: Paths to the model patches for dgm
         num_evals: Repeated number of swe evaluations
     """
+    # A truncated parent patch otherwise fails inside every instance container.
+    preflight_model_patches(model_patch_paths)
     if model_patch_paths:
         for model_patch_path in model_patch_paths:
             # Read and modify model patch
             with open(model_patch_path, 'r') as f:
                 patch_content = f.read()
-            patch_content = remove_patch_by_files(patch_content)
+            patch_content = ensure_trailing_newline(remove_patch_by_files(patch_content))
             # Placeholder for any patch modifications if needed
             with open(model_patch_path, 'w') as f:
                 f.write(patch_content)
