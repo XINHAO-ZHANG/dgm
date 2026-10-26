@@ -324,6 +324,7 @@ class RecoveryController:
 
     def summary(self) -> dict:
         auec = self.ledger.auec()
+        salvage_rate, salvaged, failed = self._salvage_stats()
         return {
             "generation": self.generation,
             "active": asdict(self.active) if self.active else None,
@@ -333,8 +334,31 @@ class RecoveryController:
             "cumulative_evaluations": self.ledger.cumulative_evaluations,
             "cumulative_tokens": self.ledger.cumulative_tokens,
             "decisions": [event.get("decision") for event in self.ledger.events if event.get("decision")],
+            "salvage_rate": salvage_rate,
+            "salvage_accepted_after_debug": salvaged,
+            "salvage_failed_first_verify": failed,
             **auec,
         }
+
+    def _salvage_stats(self) -> tuple[float | None, int, int]:
+        """Fraction of first-verify failures later accepted after debug.
+
+        An immediate accept did not fail verification. A rollback, or an
+        accept that used at least one debug round, counts as a first-verify
+        failure. The rate is null when that denominator is zero.
+        """
+
+        failed = 0
+        salvaged = 0
+        for attempt in self.attempts:
+            if attempt.decision == "accept" and attempt.debug_count <= 0:
+                continue
+            failed += 1
+            if attempt.decision == "accept" and attempt.debug_count > 0:
+                salvaged += 1
+        if failed == 0:
+            return None, 0, 0
+        return salvaged / failed, salvaged, failed
 
     def to_dict(self) -> dict:
         return {

@@ -4,12 +4,13 @@ Single active agent, a small trusted checkpoint bank, and an explicit
 recovery policy. ``DGM_outer.py`` is unchanged and remains the archive
 baseline.
 
-Dry run (no API keys, no Docker, no Polyglot evolution)::
+Dry run (no API keys, no container, no Polyglot evolution)::
 
     python3 EvoPilot_outer.py --dry_run
 
-Live Polyglot evolution uses the same self-improve and harness path as DGM
-and needs the API keys plus Docker setup described in the README.
+Live Polyglot evolution uses the same self-improve and harness path as DGM.
+``DGM_CONTAINER_RUNTIME=apptainer`` selects Apptainer when no Docker daemon
+is available. API keys and the dataset cache are still required.
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--accept_margin", type=float, default=0.0, help="Required score gain over the active agent.")
     parser.add_argument("--catastrophic_drop", type=float, default=0.2, help="Score drop treated as a structural regression.")
     parser.add_argument("--benchmark", choices=["polyglot", "swe"], default="polyglot")
-    parser.add_argument("--dry_run", action="store_true", help="Replay a synthetic trace. No model calls and no Docker.")
+    parser.add_argument("--dry_run", action="store_true", help="Replay a synthetic trace. No model calls and no container.")
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--continue_from", type=str, default=None, help="Resume a previous EvoPilot output directory.")
     parser.add_argument("--num_evals", type=int, default=1, help="Repeated evaluations passed through to self_improve.")
@@ -209,6 +210,17 @@ def reevaluate_candidate(output_dir: str, metadata: dict, task_list: list, *, po
     return metadata
 
 
+def live_start_message(runtime: str, benchmark: str) -> str:
+    """Banner for a live run. Names the selected runtime and does not require Docker."""
+
+    return (
+        "EvoPilot live run. This calls the DGM self-improve container and the "
+        f"{benchmark} harness using container runtime {runtime}. "
+        "Set DGM_CONTAINER_RUNTIME=apptainer when Apptainer is installed and no Docker daemon is available. "
+        "API keys and the benchmark dataset cache are still required."
+    )
+
+
 def drive_escalations(controller, evidence, rerun):
     """Turn an escalate decision into one broader sample, then a terminal decision."""
 
@@ -259,10 +271,10 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 
-    log(
-        "EvoPilot live run. This calls the DGM self-improve container and the "
-        f"{args.benchmark} harness. API keys and Docker are required."
-    )
+    from utils.container_runtime import resolve_container_runtime
+
+    runtime = resolve_container_runtime()
+    log(live_start_message(runtime, args.benchmark))
     while controller.generation < args.max_generation:
         controller.maybe_escape_stagnation()
         context = controller.replan_context()

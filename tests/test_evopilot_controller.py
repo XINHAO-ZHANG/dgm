@@ -12,7 +12,13 @@ from pathlib import Path
 import pytest
 
 import EvoPilot_outer
-from EvoPilot_outer import build_evidence, call_self_improve, main, snapshot_from_initial_metadata
+from EvoPilot_outer import (
+    build_evidence,
+    call_self_improve,
+    live_start_message,
+    main,
+    snapshot_from_initial_metadata,
+)
 from evopilot.scoring import evaluation_protocol
 from evopilot.bank import CheckpointBank, RecoverabilityWeights, recoverability_score
 from evopilot.controller import RecoveryController
@@ -440,6 +446,9 @@ def test_dry_run_writes_auec_curve_and_can_resume(tmp_path):
     assert summary["best_agent_id"] == "c2"
     assert summary["active"]["agent_id"] == "c7"
     assert set(summary["bank_ids"]) == {"initial", "c1", "c2", "c7"}
+    assert summary["salvage_accepted_after_debug"] == 1
+    assert summary["salvage_failed_first_verify"] == 5
+    assert summary["salvage_rate"] == pytest.approx(0.2)
 
     resumed = load_run(str(output))
     assert resumed.active.agent_id == "c7"
@@ -469,6 +478,8 @@ def test_dry_run_respects_max_generation(tmp_path):
     assert main(["--dry_run", "--output_dir", str(output), "--max_generation", "1"]) == 0
     summary = json.loads((output / "evopilot_summary.json").read_text(encoding="utf-8"))
     assert summary["decisions"] == ["accept"]
+    assert summary["salvage_rate"] is None
+    assert summary["salvage_failed_first_verify"] == 0
 
 
 def test_infrastructure_failure_does_not_require_docker(monkeypatch):
@@ -501,6 +512,19 @@ def test_dgm_outer_baseline_is_untouched():
 
 def test_outer_module_imports_without_the_live_stack():
     assert callable(EvoPilot_outer.main)
+
+
+def test_live_start_message_selects_apptainer_without_a_docker_daemon():
+    text = live_start_message("apptainer", "polyglot")
+    assert "runtime apptainer" in text
+    assert "DGM_CONTAINER_RUNTIME=apptainer" in text
+    assert "no Docker daemon is available" in text
+    assert "Docker are required" not in text
+    assert "Docker is required" not in text
+    readme = Path("README.md").read_text(encoding="utf-8")
+    section = readme.split("## EvoPilot recovery controller", 1)[1].split("## File Structure", 1)[0]
+    assert "DGM_CONTAINER_RUNTIME=apptainer" in section
+    assert "working Docker daemon" not in section
 
 
 def _protocol_metadata(protocol, resolved, accuracy_score):

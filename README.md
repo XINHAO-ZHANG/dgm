@@ -88,22 +88,24 @@ EvoPilot is an alternate outer loop. It keeps one active agent, a small trusted 
 
 The controller records a compute curve for later AUEC-style analysis: cumulative evaluations, best accepted score, and the score of the agent currently being evolved. Token totals are stored only when a self-improve result actually reports them. A dry run does not invent either benchmark scores or paper metrics.
 
-Smoke path, no API keys and no Docker:
+Smoke path, no API keys and no container:
 
 ```bash
 python3 EvoPilot_outer.py --dry_run --output_dir /tmp/evopilot_smoke
-python3 -m pytest tests/test_evopilot_controller.py
+python3 -m pytest tests/test_evopilot_controller.py tests/test_apptainer_compat.py
 ```
 
 The smoke command replays a fixed synthetic trace and writes:
 
 - `evopilot_trajectory.jsonl` — one row per bootstrap, verify, accept, debug, rollback, or replan, with cumulative evaluations
 - `evopilot_state.json` — active agent, checkpoint bank, and evolution memory
-- `evopilot_summary.json` — AUEC numbers and an explicit synthetic-run disclaimer
+- `evopilot_summary.json` — AUEC numbers, salvage rate, and an explicit synthetic-run disclaimer
 
-Live Polyglot evolution uses the existing self-improve container and Polyglot harness. It needs the same setup as DGM: `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`, a working Docker daemon, `pip install -r requirements.txt`, and `python -m polyglot.prepare_polyglot_dataset`. Start with one generation; each generation is a full self-modify plus evaluation.
+Live Polyglot evolution uses the same self-improve container and Polyglot harness as DGM. It needs `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `pip install -r requirements.txt`, and `python -m polyglot.prepare_polyglot_dataset`. The container runtime follows `DGM_CONTAINER_RUNTIME` (`auto`, `docker`, or `apptainer`). On bach4, select Apptainer. A Docker daemon is not required for that path. Image build and fakeroot notes are in [APPTAINER.md](APPTAINER.md). Start with one generation; each generation is a full self-modify plus evaluation.
 
 ```bash
+export PATH="$HOME/software/apptainer/bin:$PATH"
+export DGM_CONTAINER_RUNTIME=apptainer
 python3 EvoPilot_outer.py --benchmark polyglot --max_generation 1 --output_dir output_evopilot/polyglot_smoke
 ```
 
