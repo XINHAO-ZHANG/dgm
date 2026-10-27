@@ -20,6 +20,13 @@ from swe_bench.utils import (
 )
 from utils.common_utils import load_json_file
 from utils.docker_utils import docker_from_env
+from utils.host_resources import (
+    classify_infra_error,
+    raise_for_infra_results,
+    require_resources_from_env,
+    verify_worker_block,
+)
+from utils.secret_redaction import redact_secrets
 
 def process_entry(entry, out_dname, model_name_or_path, model_patch_paths):
     """
@@ -38,6 +45,13 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths):
         print(f"Skipping existing entry {instance_id}")
         return {"success": True, "instance_id": instance_id}
 
+    blocked = verify_worker_block(instance_id)
+    if blocked is not None:
+        return blocked
+
+    client = None
+    container = None
+    logger = None
     try:
         # Create and start the Docker container
         client = docker_from_env()
@@ -171,15 +185,21 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths):
         return {"success": True, "instance_id": instance_id}
 
     except Exception as e:
-        print(f"Error processing entry {instance_id}: {str(e)}")
-        return {"success": False, "instance_id": instance_id, "error": str(e)}
+        error_text = redact_secrets(f"{type(e).__name__}: {e}")
+        infra_code = classify_infra_error(error_text)
+        print(f"Error processing entry {instance_id}: {error_text}")
+        failed = {"success": False, "instance_id": instance_id, "error": error_text}
+        if infra_code:
+            failed["infra_error_code"] = infra_code
+        return failed
 
     finally:
         # Clean up docker container
         try:
-            cleanup_container(client, container, logger)
+            if container is not None:
+                cleanup_container(client, container, logger)
         except Exception as e:
-            print(f"Error cleaning up Docker container for {instance_id}: {e}")
+            print(f"Error cleaning up Docker container for {instance_id}: {redact_secrets(str(e))}")
 
 def harness(
         test_task_list=None,
@@ -221,6 +241,7 @@ def harness(
     if num_samples > 0:
         entries = entries[:num_samples]
 
+    require_resources_from_env(phase="verify")
     # Build the environment images
     client = docker_from_env()
     build_env_images(client, dataset=entries, force_rebuild=False, max_workers=max_workers)
@@ -242,12 +263,15 @@ def harness(
             }
             
             # Process completed tasks as they finish
+            results = []
             for future in as_completed(future_to_entry):
                 result = future.result()
+                results.append(result)
                 if result["success"]:
                     print(f"Successfully processed entry {result['instance_id']} for eval {eval_idx}")
                 else:
                     print(f"Failed to process entry {result['instance_id']} for eval {eval_idx}: {result.get('error', 'Unknown error')}")
+            raise_for_infra_results(results)
         return out_dname
 
     # Process all evaluations in parallel

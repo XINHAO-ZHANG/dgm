@@ -92,7 +92,7 @@ python DGM_outer.py --polyglot
 
 ## EvoPilot recovery controller
 
-EvoPilot is an alternate outer loop. It keeps one active agent, a small trusted checkpoint bank (default K=4), and a verify → bounded debug (default R=2) → accept or rollback → replan controller. It does not replace the DGM archive. `DGM_outer.py` is the baseline and is unchanged.
+EvoPilot is an alternate outer loop. It keeps one active agent, a small trusted checkpoint bank (default K=4), and a verify → bounded debug (default R=2) → accept or rollback → replan controller. It does not replace the DGM archive. `DGM_outer.py` remains the archive baseline. Both outer loops share a host resource gate so a full disk, memory pressure, or a broken Apptainer start stops the run instead of starting another generation.
 
 The controller records a compute curve for later AUEC-style analysis: cumulative evaluations, best accepted score, and the score of the agent currently being evolved. Token totals are stored only when a self-improve result actually reports them. A dry run does not invent either benchmark scores or paper metrics.
 
@@ -100,7 +100,8 @@ Smoke path, no API keys and no container:
 
 ```bash
 python3 EvoPilot_outer.py --dry_run --output_dir /tmp/evopilot_smoke
-python3 -m pytest tests/test_evopilot_controller.py tests/test_apptainer_compat.py
+python3 EvoPilot_outer.py --dry-resource-check
+python3 -m pytest tests/test_evopilot_controller.py tests/test_apptainer_compat.py tests/test_host_resources.py
 ```
 
 The smoke command replays a fixed synthetic trace and writes:
@@ -124,6 +125,10 @@ python3 EvoPilot_outer.py --benchmark polyglot --shallow_eval --max_generation 1
 ```
 
 SWE-bench uses `--benchmark swe` and the same staging switch. Resume with `--continue_from output_evopilot/<run_id>` after `evopilot_state.json` exists.
+
+Before each Improve call and before Verify starts another sandbox, the run checks free space on `/tmp` (and `TMPDIR` / `APPTAINER_TMPDIR` / `APPTAINER_WORKSPACE_ROOT` when those paths differ) plus MemAvailable and memory pressure. Defaults are `--min-tmp-free-gb 10`, `--min-available-mem-gb 4`, and `--max-mem-pressure 10` (PSI full avg10, percent). A value of `0` disables the disk or memory floor; a negative `--max-mem-pressure` disables the PSI check. If a check fails, that generation does not call the model and does not start a sandbox.
+
+`/tmp` filling up, an out-of-memory error, an LDAP/userid lookup failure, or an Apptainer start failure sets `infra_error_code` and stops the outer loop. `--continue-on-infra-error` goes on to the next generation anyway. It does not bypass the disk and memory gates. After each generation the run deletes only Apptainer workspace directories stamped with this output directory's owner. Other users' sandboxes are left in place. `--dry-resource-check` prints the snapshot and exits. The same flags exist on `DGM_outer.py`. See [APPTAINER.md](APPTAINER.md).
 
 What is still scaffolding, not a paper run: there is no neutralized-initialization ablation, no learned recoverability model, and no claim about Polyglot or SWE-bench scores. Provider token usage is not summed inside DGM's self-improve step, so `cumulative_tokens` stays null unless that field is present on a result. Escalate uses the spread across repeated harness reports when two or more exist for the same candidate; one report is not enough to estimate variance.
 

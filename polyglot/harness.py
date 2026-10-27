@@ -20,6 +20,13 @@ from utils.git_utils import (
     remove_patch_by_files,
 )
 from utils.docker_utils import docker_from_env
+from utils.host_resources import (
+    classify_infra_error,
+    raise_for_infra_results,
+    require_resources_from_env,
+    verify_worker_block,
+)
+from utils.secret_redaction import redact_secrets
 
 from swe_bench.utils import (
     copy_to_container,
@@ -53,6 +60,13 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths):
             result = json.loads(f.read())
         return result
 
+    blocked = verify_worker_block(instance_id)
+    if blocked is not None:
+        return blocked
+
+    client = None
+    container = None
+    logger = None
     try:
         # Create and start the Docker container
         client = docker_from_env()
@@ -217,6 +231,8 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths):
         if 'proposed_model_patches' not in locals():
             proposed_model_patches = ''
 
+        error_text = redact_secrets(f"{type(e).__name__}: {e}")
+        infra_code = classify_infra_error(error_text)
         # Write result to file
         result = {
             "instance_id": instance_id,
@@ -224,19 +240,26 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths):
             "model_patch": model_patch,
             'proposed_model_patches': proposed_model_patches,
             "eval_result": eval_result,
-            "success": False
+            "success": False,
+            "error": error_text,
         }
+        if infra_code:
+            result["infra_error_code"] = infra_code
         out_fname.write_text(json.dumps(result, indent=4))
         
-        print(f"Error processing entry {instance_id}: {str(e)}")
-        return {"success": False, "instance_id": instance_id, "eval_result": eval_result}
+        print(f"Error processing entry {instance_id}: {error_text}")
+        failed = {"success": False, "instance_id": instance_id, "eval_result": eval_result, "error": error_text}
+        if infra_code:
+            failed["infra_error_code"] = infra_code
+        return failed
 
     finally:
         # Clean up docker container
         try:
-            cleanup_container(client, container, logger)
+            if container is not None:
+                cleanup_container(client, container, logger)
         except Exception as e:
-            print(f"Error cleaning up Docker container for {instance_id}: {e}")
+            print(f"Error cleaning up Docker container for {instance_id}: {redact_secrets(str(e))}")
 
 def harness(
         dataset_path="polyglot/polyglot_benchmark_metadata.json",
@@ -297,6 +320,8 @@ def harness(
     if num_samples > 0:
         entries = entries[:num_samples]
 
+    # Another sandbox (image build or instance) waits until the host has room.
+    require_resources_from_env(phase="verify")
     # Build the environment images
     client = docker_from_env()
     build_env_images(client, dataset=entries, max_workers=max_workers, force_rebuild=False)
@@ -386,6 +411,7 @@ def harness(
     with open(report_file, "w") as f:
         print(json.dumps(report, indent=4), file=f)
     print(f"Report written to {report_file}")
+    raise_for_infra_results(results)
 
     return out_dnames
 

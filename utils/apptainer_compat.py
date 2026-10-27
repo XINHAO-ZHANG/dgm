@@ -1034,6 +1034,11 @@ class ApptainerContainer:
         if self._workspace.exists():
             shutil.rmtree(self._workspace, ignore_errors=True)
         self._workspace.mkdir(parents=True, exist_ok=True)
+        # Owner marker only. Cleanup after a generation removes this run's
+        # directories and leaves every other marker (and unmarked dirs) in place.
+        from utils.host_resources import stamp_workspace
+
+        stamp_workspace(self._workspace, name=name)
         self._binds: Dict[str, Path] = {}
         self._started = False
         self._instance_name: Optional[str] = None

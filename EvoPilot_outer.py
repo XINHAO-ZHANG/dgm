@@ -32,6 +32,19 @@ from evopilot.scoring import partition, verify_schedule
 from evopilot.smoke import DRY_RUN_DISCLAIMER, run_smoke
 from evopilot.types import AgentSnapshot, Decision, VerificationEvidence
 from utils.common_utils import load_json_file
+from utils.host_resources import (
+    ResourceGateError,
+    add_resource_arguments,
+    apply_infra_metadata,
+    classify_infra_error,
+    cleanup_owned_workspaces,
+    ensure_workspace_owner,
+    publish_resource_policy,
+    require_resources,
+    resource_check_report,
+    stop_reason_for_infra,
+    thresholds_from_args,
+)
 from utils.secret_redaction import redact_secrets
 
 LIVE_DISCLAIMER = (
@@ -68,6 +81,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="Also run DGM's post-improve diagnose. The controller does not require it.",
     )
+    add_resource_arguments(parser)
     return parser.parse_args(argv)
 
 
@@ -147,16 +161,19 @@ def submitted_instances(metadata: dict) -> int:
 
 
 def failure_metadata(parent_id: str, entry: str | None, exc: BaseException) -> dict:
-    return {
-        "run_id": f"failed-{uuid.uuid4().hex[:8]}",
-        "parent_commit": parent_id,
-        "entry": entry,
-        "model_patch_notempty": False,
-        "evopilot_structural": True,
-        "evopilot_failure_cluster": "infrastructure_error",
-        "error": redact_secrets(repr(exc)),
-        "overall_performance": {},
-    }
+    text = redact_secrets(repr(exc))
+    code = classify_infra_error(text) or "infra_unhandled"
+    return apply_infra_metadata(
+        {
+            "run_id": f"failed-{uuid.uuid4().hex[:8]}",
+            "parent_commit": parent_id,
+            "entry": entry,
+            "model_patch_notempty": False,
+            "overall_performance": {},
+        },
+        code,
+        text,
+    )
 
 
 def call_self_improve(**kwargs):
@@ -233,6 +250,41 @@ def live_start_message(runtime: str, benchmark: str) -> str:
     )
 
 
+def _infra_evidence(controller, code: str, message: str, current: VerificationEvidence) -> VerificationEvidence:
+    """Structural evidence so an open attempt rolls back instead of debugging."""
+
+    from dataclasses import replace
+
+    return replace(
+        current,
+        structural_error=True,
+        compiled=False,
+        local_error=False,
+        regression=False,
+        failure_cluster="infrastructure_error",
+        notes=redact_secrets(message)[:500],
+        n_evaluations=0,
+        tokens=None,
+        targeted_failure_mode=code,
+    )
+
+
+def _is_infra(metadata: dict) -> bool:
+    return bool(metadata.get("infra_error_code"))
+
+
+def _write_summary_fields(output_dir: str, extra: dict) -> None:
+    path = os.path.join(output_dir, "evopilot_summary.json")
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    payload.update(extra)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
 def drive_escalations(controller, evidence, rerun):
     """Turn an escalate decision into one broader sample, then a terminal decision."""
 
@@ -286,6 +338,9 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
 
     from utils.container_runtime import resolve_container_runtime
 
+    thresholds = thresholds_from_args(args)
+    owner = ensure_workspace_owner(output_dir)
+    publish_resource_policy(thresholds)
     runtime = resolve_container_runtime()
     log(live_start_message(runtime, args.benchmark))
     more_size = 0 if schedule.test_task_list_more is None else len(schedule.test_task_list_more)
@@ -295,8 +350,83 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
         f"more={more_size} "
         f"threshold={schedule.test_more_threshold}"
     )
-    while controller.generation < args.max_generation:
+    log(
+        "resource gate "
+        f"min_tmp_free_gb={args.min_tmp_free_gb} "
+        f"min_available_mem_gb={args.min_available_mem_gb} "
+        f"max_mem_pressure={args.max_mem_pressure} "
+        f"continue_on_infra_error={bool(args.continue_on_infra_error)} "
+        f"workspace_owner={owner}"
+    )
+    leftover = cleanup_owned_workspaces(owner=owner)
+    if leftover:
+        log(f"removed {len(leftover)} leftover apptainer workspace(s) for this run")
+
+    stop_code = None
+    stop_message = None
+
+    def more_task_list():
+        if schedule.test_task_list_more is None:
+            return None
+        return list(schedule.test_task_list_more)
+
+    def release_workspaces() -> None:
+        removed_now = cleanup_owned_workspaces(owner=owner)
+        if removed_now:
+            log(f"removed {len(removed_now)} apptainer workspace(s) for this run")
+
+    def remember_stop(code: str, message: str) -> None:
+        nonlocal stop_code, stop_message
+        reason = stop_reason_for_infra(
+            [{"infra_error_code": code}],
+            continue_on_infra=bool(args.continue_on_infra_error),
+        )
+        if reason is None:
+            log(f"infra error {code} recorded; --continue-on-infra-error is set")
+            return
+        stop_code = reason
+        stop_message = redact_secrets(message)
+        log(f"stopping outer loop: {stop_code}: {stop_message}")
+
+    def log_decision(result) -> None:
+        log(
+            f"generation {controller.generation} decision={result.decision.value} "
+            f"reason={result.reason} active={result.active.agent_id} score={result.active.score}"
+        )
+
+    def close_open_for_gate(code: str, message: str):
+        open_entry = controller.memory.open_entry
+        if open_entry is None or open_entry.outcome != "open" or controller.active is None:
+            return None
+        current = controller._last_evidence
+        if current is None:
+            current = VerificationEvidence(
+                candidate_id="failed-infra",
+                base_agent_id=controller.active.agent_id,
+                base_score=controller.active.score,
+                candidate_score=None,
+                compiled=False,
+                regression=False,
+                structural_error=True,
+                local_error=False,
+                resolved_target=None,
+                failure_cluster="infrastructure_error",
+                change_intent="host resource gate",
+                targeted_failure_mode=code,
+                notes=redact_secrets(message)[:500],
+                score_protocol=protocol,
+                lineage_id=controller.lineage_id,
+            )
+            return controller.step(current)
+        return controller.step(_infra_evidence(controller, code, message, current))
+
+    while controller.generation < args.max_generation and stop_code is None:
         controller.maybe_escape_stagnation()
+        try:
+            require_resources(thresholds, phase="improve")
+        except ResourceGateError as exc:
+            remember_stop(exc.code, str(exc))
+            break
         context = controller.replan_context()
         assert controller.active is not None
         entry = controller.suggest_entry()
@@ -307,20 +437,23 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
         controller.begin_attempt(f"self-edit targeting {entry}", entry)
         suffix = format_improve_suffix(context)
         log(f"generation {controller.generation} improve parent={controller.active.agent_id} entry={entry}")
-        metadata = call_self_improve(
-            parent_commit=controller.active.agent_id,
-            output_dir=output_dir,
-            entry=entry,
-            num_evals=args.num_evals,
-            post_improve_diagnose=args.post_improve_diagnose,
-            test_task_list=list(schedule.test_task_list),
-            test_more_threshold=schedule.test_more_threshold,
-            test_task_list_more=None if schedule.test_task_list_more is None else list(schedule.test_task_list_more),
-            full_eval_threshold=None,
-            polyglot=polyglot,
-            problem_statement_suffix=suffix or None,
-            evopilot_role="improve",
-        )
+        try:
+            metadata = call_self_improve(
+                parent_commit=controller.active.agent_id,
+                output_dir=output_dir,
+                entry=entry,
+                num_evals=args.num_evals,
+                post_improve_diagnose=args.post_improve_diagnose,
+                test_task_list=list(schedule.test_task_list),
+                test_more_threshold=schedule.test_more_threshold,
+                test_task_list_more=more_task_list(),
+                full_eval_threshold=None,
+                polyglot=polyglot,
+                problem_statement_suffix=suffix or None,
+                evopilot_role="improve",
+            )
+        finally:
+            release_workspaces()
         evidence = build_evidence(
             metadata,
             controller,
@@ -330,11 +463,26 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
             patch_path=os.path.join(candidate_dir(output_dir, str(metadata.get("run_id"))), "model_patch.diff"),
             protocol_ids=protocol,
         )
+        if _is_infra(metadata):
+            result = controller.step(evidence)
+            log_decision(result)
+            flush_run(output_dir, controller, mode="live", disclaimer=LIVE_DISCLAIMER)
+            remember_stop(str(metadata.get("infra_error_code")), str(metadata.get("error") or metadata.get("infra_error_code")))
+            continue
+
+        held: dict[str, str] = {}
 
         def rerun_fixed(current: VerificationEvidence):
             # Repeat the same screen and the same promotion gate.
             if str(current.candidate_id).startswith("failed"):
                 return None
+            try:
+                require_resources(thresholds, phase="verify")
+            except ResourceGateError as exc:
+                held["code"] = exc.code
+                held["message"] = str(exc)
+                log(str(exc))
+                return _infra_evidence(controller, exc.code, str(exc), current)
             counted = submitted_instances(metadata)
             try:
                 updated = reevaluate_candidate(
@@ -344,10 +492,16 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
                     polyglot=polyglot,
                     num_evals=args.num_evals,
                     test_more_threshold=schedule.test_more_threshold,
-                    test_task_list_more=None if schedule.test_task_list_more is None else list(schedule.test_task_list_more),
+                    test_task_list_more=more_task_list(),
                 )
             except Exception as exc:
-                log(f"escalate re-evaluation failed: {exc}")
+                text = redact_secrets(f"{type(exc).__name__}: {exc}")
+                code = classify_infra_error(text)
+                log(f"escalate re-evaluation failed: {text}")
+                if code:
+                    held["code"] = code
+                    held["message"] = text
+                    return _infra_evidence(controller, code, text, current)
                 return None
             return build_evidence(
                 updated,
@@ -360,28 +514,50 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
             )
 
         result, evidence = drive_escalations(controller, evidence, rerun_fixed)
+        if held:
+            log_decision(result)
+            flush_run(output_dir, controller, mode="live", disclaimer=LIVE_DISCLAIMER)
+            release_workspaces()
+            remember_stop(held["code"], held["message"])
+            continue
+
+        debug_interrupted = False
         debug_guard = 0
         while result.decision == Decision.DEBUG and debug_guard < controller.policy.debug_budget:
             debug_guard += 1
+            try:
+                require_resources(thresholds, phase="improve")
+            except ResourceGateError as exc:
+                closed = close_open_for_gate(exc.code, str(exc))
+                if closed is not None:
+                    result = closed
+                    log_decision(result)
+                flush_run(output_dir, controller, mode="live", disclaimer=LIVE_DISCLAIMER)
+                remember_stop(exc.code, str(exc))
+                debug_interrupted = True
+                break
             parent = evidence.candidate_id
             if not parent or str(parent).startswith("failed"):
                 parent = controller.active.agent_id
             statement = format_debug_statement(evidence, controller.replan_context())
             log(f"generation {controller.generation} debug round {evidence.debug_round + 1} parent={parent}")
-            metadata = call_self_improve(
-                parent_commit=parent,
-                output_dir=output_dir,
-                entry=entry,
-                num_evals=args.num_evals,
-                post_improve_diagnose=False,
-                test_task_list=list(schedule.test_task_list),
-                test_more_threshold=schedule.test_more_threshold,
-                test_task_list_more=None if schedule.test_task_list_more is None else list(schedule.test_task_list_more),
-                full_eval_threshold=None,
-                polyglot=polyglot,
-                problem_statement_override=statement,
-                evopilot_role="debug",
-            )
+            try:
+                metadata = call_self_improve(
+                    parent_commit=parent,
+                    output_dir=output_dir,
+                    entry=entry,
+                    num_evals=args.num_evals,
+                    post_improve_diagnose=False,
+                    test_task_list=list(schedule.test_task_list),
+                    test_more_threshold=schedule.test_more_threshold,
+                    test_task_list_more=more_task_list(),
+                    full_eval_threshold=None,
+                    polyglot=polyglot,
+                    problem_statement_override=statement,
+                    evopilot_role="debug",
+                )
+            finally:
+                release_workspaces()
             evidence = build_evidence(
                 metadata,
                 controller,
@@ -391,20 +567,52 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
                 patch_path=os.path.join(candidate_dir(output_dir, str(metadata.get("run_id"))), "model_patch.diff"),
                 protocol_ids=protocol,
             )
+            if _is_infra(metadata):
+                result = controller.step(evidence)
+                log_decision(result)
+                flush_run(output_dir, controller, mode="live", disclaimer=LIVE_DISCLAIMER)
+                remember_stop(str(metadata.get("infra_error_code")), str(metadata.get("error") or metadata.get("infra_error_code")))
+                debug_interrupted = True
+                break
             result, evidence = drive_escalations(controller, evidence, rerun_fixed)
-        log(
-            f"generation {controller.generation} decision={result.decision.value} "
-            f"reason={result.reason} active={result.active.agent_id} score={result.active.score}"
-        )
+            if held:
+                log_decision(result)
+                flush_run(output_dir, controller, mode="live", disclaimer=LIVE_DISCLAIMER)
+                release_workspaces()
+                remember_stop(held["code"], held["message"])
+                debug_interrupted = True
+                break
+        if stop_code is not None:
+            break
+        if debug_interrupted:
+            continue
+        log_decision(result)
         flush_run(output_dir, controller, mode="live", disclaimer=LIVE_DISCLAIMER)
+        release_workspaces()
     summary = controller.summary()
     summary["mode"] = "live"
     summary["disclaimer"] = LIVE_DISCLAIMER
+    summary["stop_reason"] = stop_message
+    summary["infra_error_code"] = stop_code
+    summary["workspace_owner"] = owner
+    _write_summary_fields(
+        output_dir,
+        {
+            "stop_reason": stop_message,
+            "infra_error_code": stop_code,
+            "workspace_owner": owner,
+        },
+    )
     return summary
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.dry_resource_check:
+        report = resource_check_report(thresholds_from_args(args))
+        report["continue_on_infra_error"] = bool(args.continue_on_infra_error)
+        print(json.dumps(report, indent=2))
+        return 0 if report["ok"] else 2
     output_dir = resolve_output_dir(args)
     if args.dry_run:
         if args.continue_from:
@@ -428,8 +636,10 @@ def main(argv=None) -> int:
         "cumulative_evaluations": summary.get("cumulative_evaluations"),
         "cumulative_tokens": summary.get("cumulative_tokens"),
         "decisions": summary.get("decisions"),
+        "stop_reason": summary.get("stop_reason"),
+        "infra_error_code": summary.get("infra_error_code"),
     }, indent=2))
-    return 0
+    return 2 if summary.get("infra_error_code") else 0
 
 
 if __name__ == "__main__":
