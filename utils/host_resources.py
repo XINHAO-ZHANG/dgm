@@ -295,6 +295,81 @@ def _workspace_root() -> Path:
     return get_workspace_root()
 
 
+
+def sweep_abandoned_workspaces(
+    root: os.PathLike | None = None,
+    *,
+    also_tmp: bool = True,
+) -> list[str]:
+    """Remove abandoned sandboxes under the configured workspace root.
+
+    Keeps foreign owner-marked directories. Removes:
+      - directories stamped with this process/run owner (via cleanup_owned_workspaces)
+      - unmarked direct children that look like leftover sandboxes (empty, or
+        containing only a rootfs / apptainer metadata)
+    Optionally clears stale ``apptainer-* scratch dirs under APPTAINER_TMPDIR /
+    TMPDIR when those roots are dedicated (not the system ``/tmp`` itself).
+    """
+
+    removed = cleanup_owned_workspaces(root=root)
+    base = Path(root) if root is not None else _workspace_root()
+    if base.is_dir():
+        try:
+            children = list(base.iterdir())
+        except OSError:
+            children = []
+        for child in children:
+            try:
+                if child.is_symlink() or not child.is_dir():
+                    continue
+            except OSError:
+                continue
+            stamped = read_owner_marker(child)
+            if stamped is not None:
+                continue
+            # Unmarked leftover: remove if empty or looks like a sandbox.
+            try:
+                entries = list(child.iterdir())
+            except OSError:
+                continue
+            names = {p.name for p in entries}
+            looks_sandbox = (not entries) or names <= {"rootfs", ".env", "env"} or "rootfs" in names
+            if not looks_sandbox:
+                continue
+            shutil.rmtree(child, ignore_errors=True)
+            if not child.exists():
+                removed.append(str(child))
+
+    if also_tmp:
+        for key in ("APPTAINER_TMPDIR", "TMPDIR"):
+            raw = os.environ.get(key, "").strip()
+            if not raw:
+                continue
+            tmp_root = Path(raw)
+            # Never wipe the real system /tmp; only dedicated subdirs.
+            if tmp_root.resolve() == Path("/tmp"):
+                continue
+            if not tmp_root.is_dir():
+                continue
+            try:
+                kids = list(tmp_root.iterdir())
+            except OSError:
+                continue
+            for child in kids:
+                try:
+                    if child.is_symlink():
+                        continue
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+                    if not child.exists():
+                        removed.append(str(child))
+                except OSError:
+                    continue
+    return removed
+
+
 def cleanup_owned_workspaces(
     root: os.PathLike | None = None,
     owner: str | None = None,

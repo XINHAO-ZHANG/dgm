@@ -38,6 +38,7 @@ from utils.host_resources import (
     apply_infra_metadata,
     classify_infra_error,
     cleanup_owned_workspaces,
+    sweep_abandoned_workspaces,
     ensure_workspace_owner,
     publish_resource_policy,
     require_resources,
@@ -358,7 +359,7 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
         f"continue_on_infra_error={bool(args.continue_on_infra_error)} "
         f"workspace_owner={owner}"
     )
-    leftover = cleanup_owned_workspaces(owner=owner)
+    leftover = sweep_abandoned_workspaces()
     if leftover:
         log(f"removed {len(leftover)} leftover apptainer workspace(s) for this run")
 
@@ -371,7 +372,7 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
         return list(schedule.test_task_list_more)
 
     def release_workspaces() -> None:
-        removed_now = cleanup_owned_workspaces(owner=owner)
+        removed_now = sweep_abandoned_workspaces()
         if removed_now:
             log(f"removed {len(removed_now)} apptainer workspace(s) for this run")
 

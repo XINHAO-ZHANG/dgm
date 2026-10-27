@@ -1,16 +1,18 @@
 from pathlib import Path
 import subprocess
+from typing import Optional, Sequence
+
 
 def tool_info():
     return {
         "name": "editor",
         "description": """Custom editing tool for viewing, creating, and editing files\n
 * State is persistent across command calls and discussions with the user.\n
-* If `path` is a file, `view` displays the entire file with line numbers. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep.\n
+* If `path` is a file, `view` displays the file with line numbers. Optional `view_range` [start_line, end_line] (1-indexed, inclusive; end_line -1 means EOF) shows only that slice. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep (`view_range` is ignored).\n
 * The `create` command cannot be used if the specified `path` already exists as a file.\n
 * If a `command` generates a long output, it will be truncated and marked with `<response clipped>`.\n
 * The `edit` command overwrites the entire file with the provided `file_text`.\n
-* No partial/line-range edits or partial viewing are supported.""",
+* Partial/line-range edits are not supported; use `edit` with the full file text.""",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -26,17 +28,26 @@ def tool_info():
                 "file_text": {
                     "description": "Required parameter of `create` or `edit` command, containing the content for the entire file.",
                     "type": "string"
-                }
+                },
+                "view_range": {
+                    "description": "Optional for `view` on a file. [start_line, end_line], 1-indexed inclusive. Use end_line -1 for EOF. Ignored for directories.",
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 2,
+                    "maxItems": 2,
+                },
             },
             "required": ["command", "path"]
         }
     }
+
 
 def maybe_truncate(content: str, max_length: int = 10000) -> str:
     """Truncate long content and add marker."""
     if len(content) > max_length:
         return content[:max_length] + "\n<response clipped>"
     return content
+
 
 def validate_path(path: str, command: str) -> Path:
     """
@@ -72,6 +83,7 @@ def validate_path(path: str, command: str) -> Path:
 
     return path_obj
 
+
 def format_output(content: str, path: str, init_line: int = 1) -> str:
     """Format output with line numbers (for file content)."""
     content = maybe_truncate(content)
@@ -82,12 +94,14 @@ def format_output(content: str, path: str, init_line: int = 1) -> str:
     ]
     return f"Here's the result of running `cat -n` on {path}:\n" + "\n".join(numbered_lines) + "\n"
 
+
 def read_file(path: Path) -> str:
     """Read and return the entire file contents."""
     try:
         return path.read_text()
     except Exception as e:
         raise ValueError(f"Failed to read file: {e}")
+
 
 def write_file(path: Path, content: str):
     """Write (overwrite) entire file contents."""
@@ -96,8 +110,34 @@ def write_file(path: Path, content: str):
     except Exception as e:
         raise ValueError(f"Failed to write file: {e}")
 
-def view_path(path_obj: Path) -> str:
-    """View the entire file contents or directory listing."""
+
+def _normalize_view_range(view_range: Optional[Sequence[int]], n_lines: int) -> tuple[int, int]:
+    """Return 0-based [start, end) slice bounds from a 1-indexed inclusive range."""
+    if view_range is None:
+        return 0, n_lines
+    if not isinstance(view_range, (list, tuple)) or len(view_range) != 2:
+        raise ValueError("view_range must be [start_line, end_line]")
+    start_line, end_line = int(view_range[0]), int(view_range[1])
+    if start_line < 1:
+        raise ValueError(f"view_range start_line must be >= 1, got {start_line}")
+    start_idx = start_line - 1
+    if start_idx >= n_lines:
+        raise ValueError(
+            f"view_range start_line {start_line} is past end of file ({n_lines} lines)"
+        )
+    if end_line == -1:
+        end_idx = n_lines
+    else:
+        if end_line < start_line:
+            raise ValueError(
+                f"view_range end_line {end_line} must be >= start_line {start_line} or -1"
+            )
+        end_idx = min(n_lines, end_line)  # inclusive end -> exclusive slice
+    return start_idx, end_idx
+
+
+def view_path(path_obj: Path, view_range: Optional[Sequence[int]] = None) -> str:
+    """View file contents (optionally a line range) or directory listing."""
     if path_obj.is_dir():
         # For directories: list non-hidden files up to 2 levels deep
         try:
@@ -115,14 +155,23 @@ def view_path(path_obj: Path) -> str:
         except Exception as e:
             raise ValueError(f"Failed to list directory: {e}")
 
-    # If it's a file, show the entire file with line numbers
+    # If it's a file, show (a slice of) the file with line numbers
     content = read_file(path_obj)
-    return format_output(content, str(path_obj))
+    lines = content.split("\n")
+    start_idx, end_idx = _normalize_view_range(view_range, len(lines))
+    selected = "\n".join(lines[start_idx:end_idx])
+    return format_output(selected, str(path_obj), init_line=start_idx + 1)
 
-def tool_function(command: str, path: str, file_text: str = None) -> str:
+
+def tool_function(
+    command: str,
+    path: str,
+    file_text: str = None,
+    view_range: Optional[Sequence[int]] = None,
+) -> str:
     """
     Main tool function that handles:
-      - 'view'  : View the entire file or directory listing
+      - 'view'  : View the entire file (or view_range slice) or directory listing
       - 'create': Create a new file with the given file_text
       - 'edit'  : Overwrite an existing file with file_text
     """
@@ -130,7 +179,7 @@ def tool_function(command: str, path: str, file_text: str = None) -> str:
         path_obj = validate_path(path, command)
 
         if command == "view":
-            return view_path(path_obj)
+            return view_path(path_obj, view_range=view_range)
 
         elif command == "create":
             if file_text is None:
@@ -150,7 +199,9 @@ def tool_function(command: str, path: str, file_text: str = None) -> str:
     except Exception as e:
         return f"Error: {str(e)}"
 
+
 if __name__ == "__main__":
-    # Example usage
-    result = tool_function("view", "./coding_agent.py", view_range=[1, 10])
+    # Example usage (absolute path required by validate_path)
+    sample = Path(__file__).resolve().parent.parent / "coding_agent.py"
+    result = tool_function("view", str(sample), view_range=[1, 10])
     print(result)

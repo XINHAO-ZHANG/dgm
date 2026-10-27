@@ -17,6 +17,7 @@ from utils.host_resources import (
     add_resource_arguments,
     classify_infra_error,
     cleanup_owned_workspaces,
+    sweep_abandoned_workspaces,
     ensure_workspace_owner,
     publish_resource_policy,
     require_resources,
@@ -311,7 +312,7 @@ def main(argv=None):
         bool(args.continue_on_infra_error),
         owner,
     )
-    leftover = cleanup_owned_workspaces(owner=owner)
+    leftover = sweep_abandoned_workspaces()
     if leftover:
         logger.info("removed %s leftover apptainer workspace(s) for this run", len(leftover))
     test_more_threshold = 0.4
@@ -381,7 +382,7 @@ def main(argv=None):
                     if code:
                         infra_found.append({"infra_error_code": code})
 
-        removed = cleanup_owned_workspaces(owner=owner)
+        removed = sweep_abandoned_workspaces()
         if removed:
             logger.info("removed %s apptainer workspace(s) for this run", len(removed))
 
