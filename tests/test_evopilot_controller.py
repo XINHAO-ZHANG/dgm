@@ -19,7 +19,7 @@ from EvoPilot_outer import (
     main,
     snapshot_from_initial_metadata,
 )
-from evopilot.scoring import evaluation_protocol
+from evopilot.scoring import evaluation_protocol, verify_schedule
 from evopilot.bank import CheckpointBank, RecoverabilityWeights, recoverability_score
 from evopilot.controller import RecoveryController
 from evopilot.evidence import evidence_from_dgm_metadata, parse_diff_paths
@@ -714,3 +714,67 @@ def test_incomplete_baseline_cache_is_not_scored_with_the_full_suite_fraction(tm
             "initial/metadata.json",
             evaluation_protocol(small, medium, shallow=False),
         )
+
+
+def test_default_verify_schedule_matches_dgm_polyglot_staging():
+    """Live Polyglot starts on small.json and promotes to medium.json at 0.4.
+
+    ``--shallow_eval`` keeps the screen and does not open the second stage.
+    Accept stays on the screen, so a candidate that never promotes is still
+    comparable. The medium stage is extra submitted instances.
+    """
+
+    small = json.loads(Path("polyglot/subsets/small.json").read_text(encoding="utf-8"))
+    medium = json.loads(Path("polyglot/subsets/medium.json").read_text(encoding="utf-8"))
+    assert len(small) == 10
+    assert len(medium) == 50
+    staged = verify_schedule(small, medium, shallow=False, threshold=0.4)
+    assert staged.test_task_list == tuple(small)
+    assert staged.test_more_threshold == 0.4
+    assert staged.test_task_list_more == tuple(medium)
+    assert staged.score_protocol == tuple(small)
+    smoke = verify_schedule(small, medium, shallow=True, threshold=0.4)
+    assert smoke.test_more_threshold is None
+    assert smoke.test_task_list_more is None
+    assert smoke.score_protocol == tuple(small)
+
+    dgm = Path("DGM_outer.py").read_text(encoding="utf-8")
+    assert "test_more_threshold = 0.4" in dgm
+    assert "test_more_threshold=None if args.shallow_eval else test_more_threshold" in dgm
+    assert "test_task_list_more=None if args.shallow_eval else swe_issues_med" in dgm
+    harness = Path("self_improve_step.py").read_text(encoding="utf-8")
+    assert ">= len(test_task_list) * test_more_threshold" in harness
+    outer = Path("EvoPilot_outer.py").read_text(encoding="utf-8")
+    assert "verify_schedule(" in outer
+    assert "test_more_threshold=schedule.test_more_threshold" in outer
+    assert "test_more_threshold=None" not in outer
+
+    initial = snapshot_from_initial_metadata("initial_polyglot/metadata.json", staged.score_protocol)
+    assert initial.score == pytest.approx(0.2)
+    controller = RecoveryController()
+    controller.bootstrap(initial)
+    screen = list(staged.score_protocol)
+    resolved = list(initial.resolved_ids)
+    held = _protocol_metadata(screen, resolved, accuracy_score=0.99)
+    held["overall_performance_deep"] = {
+        "accuracy_score": 0.2,
+        "total_submitted_instances": len(medium),
+        "total_resolved_ids": resolved[:1],
+        "total_unresolved_ids": [],
+        "total_emptypatch_ids": [],
+    }
+    built = build_evidence(
+        held,
+        controller,
+        debug_round=0,
+        escalations_used=0,
+        already_counted=0,
+        patch_path=None,
+        protocol_ids=staged.score_protocol,
+    )
+    assert built.protocol_mismatch is False
+    assert built.candidate_score == pytest.approx(initial.score)
+    assert built.n_evaluations == len(small) + len(medium)
+    decision = controller.step(built)
+    assert decision.decision != Decision.ACCEPT
+    assert decision.reason != "incomparable_evaluation_protocol"

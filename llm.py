@@ -23,6 +23,7 @@ AVAILABLE_LLMS = [
     "o3-mini-2025-01-31",
     # OpenRouter models
     "llama3.1-405b",
+    "qwen/qwen3-coder-flash",
     # Anthropic Claude models via Amazon Bedrock
     "bedrock/anthropic.claude-3-sonnet-20240229-v1:0",
     "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
@@ -78,6 +79,14 @@ def create_client(model: str):
         base_url = os.getenv("OPENAI_BASE_URL")
         if base_url:
             kwargs["base_url"] = base_url
+        return openai.OpenAI(**kwargs), model
+    elif model.startswith("qwen/"):
+        print(f"Using OpenAI-compatible API with model {model}.")
+        kwargs = {}
+        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+        if api_key:
+            kwargs["api_key"] = api_key
+        kwargs["base_url"] = os.getenv("OPENAI_BASE_URL") or "https://openrouter.ai/api/v1"
         return openai.OpenAI(**kwargs), model
     elif model.startswith("deepseek-"):
         print(f"Using OpenAI API with {model}.")
@@ -237,6 +246,21 @@ def get_response_from_llm(
             n=1,
             stop=None,
             seed=0,
+        )
+        content = response.choices[0].message.content
+        new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
+    elif model.startswith("qwen/"):
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_message},
+                *new_msg_history,
+            ],
+            temperature=temperature,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            n=1,
+            stop=None,
         )
         content = response.choices[0].message.content
         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]

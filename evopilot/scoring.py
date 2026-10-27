@@ -2,22 +2,61 @@
 
 Harness ``accuracy_score`` is resolved/submitted for whatever the report
 happened to contain. The cached initial Polyglot run is the full suite
-(about 225 problems). A live verify is ``small.json`` or the union of
-``small.json`` and ``medium.json``. Those fractions are not comparable:
-the same initial agent is 0.142 on the full suite and 0.20 on the small
-subset. Accept uses the count of resolved ids on the run's protocol,
-and only when both agents have a result for every problem in that set.
+(about 225 problems). A staged live verify starts on ``small.json`` and,
+when that screen clears DGM's threshold, also runs ``medium.json``.
+Those fractions are not comparable: the same initial agent is 0.142 on
+the full suite and 0.20 on the small subset. Accept uses the count of
+resolved ids on the screen every candidate finishes, and only when both
+agents have a result for every problem in that set.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import NamedTuple
 
 from evopilot.types import AgentSnapshot, VerificationEvidence
 
 
+class VerifySchedule(NamedTuple):
+    """DGM's Polyglot screen, then the larger subset when the screen clears.
+
+    ``score_protocol`` is the screen. Every candidate is evaluated there, so
+    accept and rollback stay on one denominator. ``test_task_list_more`` is
+    the second stage DGM stores as ``overall_performance_deep``.
+    """
+
+    test_task_list: tuple[str, ...]
+    test_more_threshold: float | None
+    test_task_list_more: tuple[str, ...] | None
+    score_protocol: tuple[str, ...]
+
+
+def verify_schedule(small: list, medium: list, *, shallow: bool, threshold: float = 0.4) -> VerifySchedule:
+    """Match ``DGM_outer`` staging.
+
+    The default runs ``small``, then ``medium`` when
+    ``total_resolved_instances >= threshold * len(small)``. ``shallow``
+    keeps the screen and skips the second stage.
+    """
+
+    screen = tuple(small)
+    if not screen:
+        raise RuntimeError("The evaluation screen is empty.")
+    if shallow:
+        return VerifySchedule(screen, None, None, screen)
+    if threshold < 0:
+        raise RuntimeError("The staging threshold must be non-negative.")
+    return VerifySchedule(screen, float(threshold), tuple(medium), screen)
+
+
 def evaluation_protocol(small: list, medium: list, *, shallow: bool) -> tuple[str, ...]:
-    """The single problem set used for every accept/rollback in a run."""
+    """One combined problem set.
+
+    ``shallow`` is ``small`` alone. Otherwise this is the unique union of
+    ``small`` and ``medium``. The live loop does not use the union: staged
+    verify calls ``verify_schedule`` and scores the screen.
+    """
 
     chosen = list(small) if shallow else list(small) + list(medium)
     ordered: list[str] = []

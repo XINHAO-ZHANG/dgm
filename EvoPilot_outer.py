@@ -28,7 +28,7 @@ from evopilot.evidence import evidence_from_dgm_metadata, with_escalation_fallba
 from evopilot.policy import VerifyPolicy
 from evopilot.replan import format_debug_statement, format_improve_suffix
 from evopilot.reporting import flush_run, load_run
-from evopilot.scoring import evaluation_protocol, partition
+from evopilot.scoring import partition, verify_schedule
 from evopilot.smoke import DRY_RUN_DISCLAIMER, run_smoke
 from evopilot.types import AgentSnapshot, Decision, VerificationEvidence
 from utils.common_utils import load_json_file
@@ -54,13 +54,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--shallow_eval",
         action="store_true",
-        help="Score every accept and rollback on small.json only. The default protocol is small.json plus medium.json.",
+        help="Smoke only: evaluate small.json and skip the medium stage. The default is DGM staging, small then medium.",
     )
     parser.add_argument(
         "--eval_threshold",
         type=float,
         default=0.4,
-        help="Kept so existing commands still parse. The accept set does not depend on this threshold.",
+        help="Promote from small.json to medium.json when resolved instances reach this fraction of the screen. Ignored with --shallow_eval.",
     )
     parser.add_argument(
         "--post_improve_diagnose",
@@ -185,7 +185,16 @@ def build_evidence(metadata: dict, controller: RecoveryController, *, debug_roun
     )
 
 
-def reevaluate_candidate(output_dir: str, metadata: dict, task_list: list, *, polyglot: bool, num_evals: int) -> dict:
+def reevaluate_candidate(
+    output_dir: str,
+    metadata: dict,
+    task_list: list,
+    *,
+    polyglot: bool,
+    num_evals: int,
+    test_more_threshold: float | None = None,
+    test_task_list_more: list | None = None,
+) -> dict:
     from self_improve_step import run_harness_polyglot, run_harness_swe
     from utils.evo_utils import get_model_patch_paths
 
@@ -199,11 +208,13 @@ def reevaluate_candidate(output_dir: str, metadata: dict, task_list: list, *, po
     entry = metadata.get("entry")
     if polyglot:
         run_harness_polyglot(
-            entry, run_id, patch_files, num_evals, folder, metadata, run_id, None, task_list, None,
+            entry, run_id, patch_files, num_evals, folder, metadata, run_id,
+            test_more_threshold, task_list, test_task_list_more,
         )
     else:
         run_harness_swe(
-            entry, run_id, patch_files, num_evals, folder, metadata, run_id, None, task_list, None,
+            entry, run_id, patch_files, num_evals, folder, metadata, run_id,
+            test_more_threshold, task_list, test_task_list_more,
         )
     with open(os.path.join(folder, "metadata.json"), "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
@@ -241,7 +252,8 @@ def drive_escalations(controller, evidence, rerun):
 def run_live(args: argparse.Namespace, output_dir: str) -> dict:
     os.makedirs(output_dir, exist_ok=True)
     small, medium = load_task_lists(args.benchmark)
-    protocol = evaluation_protocol(small, medium, shallow=args.shallow_eval)
+    schedule = verify_schedule(small, medium, shallow=args.shallow_eval, threshold=args.eval_threshold)
+    protocol = schedule.score_protocol
     state_path = os.path.join(output_dir, "evopilot_state.json")
     if args.continue_from:
         if not os.path.exists(state_path):
@@ -275,6 +287,13 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
 
     runtime = resolve_container_runtime()
     log(live_start_message(runtime, args.benchmark))
+    more_size = 0 if schedule.test_task_list_more is None else len(schedule.test_task_list_more)
+    log(
+        "verify schedule "
+        f"screen={len(schedule.test_task_list)} "
+        f"more={more_size} "
+        f"threshold={schedule.test_more_threshold}"
+    )
     while controller.generation < args.max_generation:
         controller.maybe_escape_stagnation()
         context = controller.replan_context()
@@ -293,9 +312,9 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
             entry=entry,
             num_evals=args.num_evals,
             post_improve_diagnose=args.post_improve_diagnose,
-            test_task_list=list(protocol),
-            test_more_threshold=None,
-            test_task_list_more=None,
+            test_task_list=list(schedule.test_task_list),
+            test_more_threshold=schedule.test_more_threshold,
+            test_task_list_more=None if schedule.test_task_list_more is None else list(schedule.test_task_list_more),
             full_eval_threshold=None,
             polyglot=polyglot,
             problem_statement_suffix=suffix or None,
@@ -312,14 +331,19 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
         )
 
         def rerun_fixed(current: VerificationEvidence):
-            # A second sample has to use the same problem set. Re-running the
-            # medium subset alone would replace the report and change the denominator.
+            # Repeat the same screen and the same promotion gate.
             if str(current.candidate_id).startswith("failed"):
                 return None
             counted = submitted_instances(metadata)
             try:
                 updated = reevaluate_candidate(
-                    output_dir, metadata, list(protocol), polyglot=polyglot, num_evals=args.num_evals,
+                    output_dir,
+                    metadata,
+                    list(schedule.test_task_list),
+                    polyglot=polyglot,
+                    num_evals=args.num_evals,
+                    test_more_threshold=schedule.test_more_threshold,
+                    test_task_list_more=None if schedule.test_task_list_more is None else list(schedule.test_task_list_more),
                 )
             except Exception as exc:
                 log(f"escalate re-evaluation failed: {exc}")
@@ -349,9 +373,9 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
                 entry=entry,
                 num_evals=args.num_evals,
                 post_improve_diagnose=False,
-                test_task_list=list(protocol),
-                test_more_threshold=None,
-                test_task_list_more=None,
+                test_task_list=list(schedule.test_task_list),
+                test_more_threshold=schedule.test_more_threshold,
+                test_task_list_more=None if schedule.test_task_list_more is None else list(schedule.test_task_list_more),
                 full_eval_threshold=None,
                 polyglot=polyglot,
                 problem_statement_override=statement,

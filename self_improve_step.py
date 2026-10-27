@@ -25,7 +25,7 @@ from utils.docker_utils import (
 )
 
 dataset = None
-diagnose_model = 'gpt-4o-mini'
+diagnose_model = 'qwen/qwen3-coder-flash'
 
 def diagnose_problem(entry, commit, root_dir, out_dir, patch_files=[], max_attempts=3, polyglot=False):
     client = create_client(diagnose_model)

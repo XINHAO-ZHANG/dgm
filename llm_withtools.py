@@ -11,8 +11,9 @@ from prompts.tooluse_prompt import get_tooluse_prompt
 from tools import load_all_tools
 
 CLAUDE_MODEL = 'bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0'
-# Chat-completions id. o3 uses client.responses.create, which OpenRouter does not serve.
-OPENAI_MODEL = 'gpt-4o-mini'
+# OpenRouter chat-completions id for the Scalability MVP backbone.
+# o3 uses client.responses.create, which OpenRouter does not serve.
+OPENAI_MODEL = 'qwen/qwen3-coder-flash'
 
 def process_tool_call(tools_dict, tool_name, tool_input):
     try:

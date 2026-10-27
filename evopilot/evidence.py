@@ -140,8 +140,13 @@ def evidence_from_dgm_metadata(
         deep = {}
     protocol = tuple(protocol_ids or ())
     protocol_mismatch = False
+    # Both stages count toward the task-eval budget. The score still comes
+    # from whichever report covers the screen.
+    stage_submitted = int(perf.get("total_submitted_instances") or 0) + int(
+        deep.get("total_submitted_instances") or 0
+    )
     if protocol:
-        score_source, resolved, unresolved, empty, missing = _protocol_block(perf, deep, protocol)
+        _score_source, resolved, unresolved, empty, missing = _protocol_block(perf, deep, protocol)
         base_resolved, _, _, base_missing = partition(
             base.resolved_ids,
             base.unresolved_ids,
@@ -155,7 +160,7 @@ def evidence_from_dgm_metadata(
         else:
             score = len(resolved) / len(protocol)
             base_score = len(base_resolved) / len(protocol)
-        submitted = int((score_source or {}).get("total_submitted_instances") or 0)
+        submitted = stage_submitted
     else:
         score_source = deep if deep.get("accuracy_score") is not None else perf
         score = score_source.get("accuracy_score") if score_source else None
@@ -165,7 +170,7 @@ def evidence_from_dgm_metadata(
         resolved = tuple(score_source.get("total_resolved_ids") or perf.get("total_resolved_ids") or ())
         unresolved = tuple(score_source.get("total_unresolved_ids") or perf.get("total_unresolved_ids") or ())
         empty = tuple(score_source.get("total_emptypatch_ids") or perf.get("total_emptypatch_ids") or ())
-        submitted = int(perf.get("total_submitted_instances") or 0) + int(deep.get("total_submitted_instances") or 0)
+        submitted = stage_submitted
     patch_nonempty = bool(metadata.get("model_patch_notempty"))
     has_score = score is not None
     compiled = patch_nonempty and has_score and (len(resolved) + len(unresolved) > 0)

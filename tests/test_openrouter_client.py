@@ -33,8 +33,51 @@ def test_llama_openrouter_client_returns_a_client(monkeypatch):
     assert str(client.base_url).rstrip("/") == "https://openrouter.ai/api/v1"
 
 
+def test_qwen3_coder_flash_defaults_to_openrouter(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    client, model = llm.create_client("qwen/qwen3-coder-flash")
+    assert model == "qwen/qwen3-coder-flash"
+    assert not isinstance(client, tuple)
+    assert client.api_key == "test-openrouter-key"
+    assert str(client.base_url).rstrip("/") == "https://openrouter.ai/api/v1"
+
+    captured = {}
+
+    class _Message:
+        content = "ok"
+
+    class _Choice:
+        message = _Message()
+
+    class _Response:
+        choices = [_Choice()]
+
+    class _Completions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return _Response()
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Client:
+        chat = _Chat()
+
+    content, _history = llm.get_response_from_llm(
+        "hi",
+        _Client(),
+        "qwen/qwen3-coder-flash",
+        "system",
+    )
+    assert content == "ok"
+    assert captured["model"] == "qwen/qwen3-coder-flash"
+    assert captured["messages"][0] == {"role": "system", "content": "system"}
+
+
 def test_self_improve_model_uses_chat_completions_not_responses(monkeypatch):
-    assert llm_withtools.OPENAI_MODEL == "gpt-4o-mini"
+    assert llm_withtools.OPENAI_MODEL == "qwen/qwen3-coder-flash"
     called = {}
 
     def manual(*_args, **_kwargs):
@@ -51,7 +94,7 @@ def test_self_improve_model_uses_chat_completions_not_responses(monkeypatch):
     assert called == {"manual": True}
 
     source = Path("self_improve_step.py").read_text(encoding="utf-8")
-    assert "diagnose_model = 'gpt-4o-mini'" in source
+    assert "diagnose_model = 'qwen/qwen3-coder-flash'" in source
     assert '"OPENROUTER_API_KEY"' in source
     assert '"OPENAI_BASE_URL"' in source
     agent = Path("coding_agent.py").read_text(encoding="utf-8")

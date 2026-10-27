@@ -28,7 +28,7 @@ export OPENAI_API_KEY='...'
 export ANTHROPIC_API_KEY='...'
 ```
 
-OpenRouter can serve the self-improve diagnose and coding calls. Put the OpenRouter key in `OPENAI_API_KEY` or `OPENROUTER_API_KEY`, and point the OpenAI client at OpenRouter. Default smoke models are `gpt-4o-mini` (chat completions). Anthropic stays optional for that path; non-self-improve SWE solving still uses Claude.
+OpenRouter serves the self-improve diagnose and coding calls. Put the OpenRouter key in `OPENAI_API_KEY` or `OPENROUTER_API_KEY`, and point the OpenAI client at OpenRouter. The Scalability MVP backbone is `qwen/qwen3-coder-flash` (chat completions). Anthropic stays optional for that path; non-self-improve SWE solving still uses Claude.
 
 ```bash
 export OPENAI_API_KEY='...'          # or OPENROUTER_API_KEY
@@ -109,15 +109,21 @@ The smoke command replays a fixed synthetic trace and writes:
 - `evopilot_state.json` — active agent, checkpoint bank, and evolution memory
 - `evopilot_summary.json` — AUEC numbers, salvage rate, and an explicit synthetic-run disclaimer
 
-Live Polyglot evolution uses the same self-improve container and Polyglot harness as DGM. It needs an OpenAI-compatible key (`OPENAI_API_KEY` or `OPENROUTER_API_KEY`), `pip install -r requirements.txt`, and `python -m polyglot.prepare_polyglot_dataset`. With `OPENAI_BASE_URL=https://openrouter.ai/api/v1`, diagnose and self-improve use `gpt-4o-mini` and Anthropic is optional. The container runtime follows `DGM_CONTAINER_RUNTIME` (`auto`, `docker`, or `apptainer`). On bach4, select Apptainer. A Docker daemon is not required for that path. Image build and fakeroot notes are in [APPTAINER.md](APPTAINER.md). Start with one generation; each generation is a full self-modify plus evaluation.
+Live Polyglot evolution uses the same self-improve container and Polyglot harness as DGM. It needs an OpenAI-compatible key (`OPENAI_API_KEY` or `OPENROUTER_API_KEY`), `pip install -r requirements.txt`, and `python -m polyglot.prepare_polyglot_dataset`. With `OPENAI_BASE_URL=https://openrouter.ai/api/v1`, diagnose and self-improve use `qwen/qwen3-coder-flash` and Anthropic is optional. The container runtime follows `DGM_CONTAINER_RUNTIME` (`auto`, `docker`, or `apptainer`). On bach4, select Apptainer. A Docker daemon is not required for that path. Image build and fakeroot notes are in [APPTAINER.md](APPTAINER.md).
+
+Polyglot Verify uses DGM's staged meter by default. No extra staging flag is required. The screen is `polyglot/subsets/small.json` (10). When `total_resolved_instances >= --eval_threshold * 10` (default `0.4`, so 4 resolved), the same candidate is also evaluated on `polyglot/subsets/medium.json` (50). That second stage is `overall_performance_deep` and counts toward cumulative task-evals. `--shallow_eval` is smoke only: it stays on the 10-problem screen and does not run medium. Accept and rollback use the screen, because every candidate finishes it; a small-set score is not compared with a medium-set or full-suite score. The cached full-suite accuracy is rescaled onto the screen from per-problem results.
 
 ```bash
 export PATH="$HOME/software/apptainer/bin:$PATH"
 export DGM_CONTAINER_RUNTIME=apptainer
+export OPENAI_BASE_URL='https://openrouter.ai/api/v1'
+# Scalability MVP. Do not pass --shallow_eval.
 python3 EvoPilot_outer.py --benchmark polyglot --max_generation 1 --output_dir output_evopilot/polyglot_smoke
+# Smoke only:
+python3 EvoPilot_outer.py --benchmark polyglot --shallow_eval --max_generation 1 --output_dir output_evopilot/polyglot_shallow
 ```
 
-SWE-bench uses `--benchmark swe`. Accept and rollback compare accuracy on one fixed problem set: `small.json` with `--shallow_eval`, otherwise the union of `small.json` and `medium.json`. The cached full-suite accuracy is rescaled onto that set from per-problem results; it is not compared directly with a subset score. `--eval_threshold` does not switch the set. Resume with `--continue_from output_evopilot/<run_id>` after `evopilot_state.json` exists.
+SWE-bench uses `--benchmark swe` and the same staging switch. Resume with `--continue_from output_evopilot/<run_id>` after `evopilot_state.json` exists.
 
 What is still scaffolding, not a paper run: there is no neutralized-initialization ablation, no learned recoverability model, and no claim about Polyglot or SWE-bench scores. Provider token usage is not summed inside DGM's self-improve step, so `cumulative_tokens` stays null unless that field is present on a result. Escalate uses the spread across repeated harness reports when two or more exist for the same candidate; one report is not enough to estimate variance.
 
