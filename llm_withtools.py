@@ -2,19 +2,47 @@ import ast
 import os
 import json
 import re
+import sys
 import anthropic
 import backoff
 import openai
 import copy
 
-from llm import create_client, get_response_from_llm
+from llm import (
+    DEFAULT_CODE_MODEL,
+    create_client,
+    get_response_from_llm,
+    uses_anthropic_messages,
+)
 from prompts.tooluse_prompt import get_tooluse_prompt
 from tools import load_all_tools
+from utils.secret_redaction import redact_secrets
 
 CLAUDE_MODEL = 'bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0'
 # OpenRouter chat-completions id for the Scalability MVP backbone.
 # o3 uses client.responses.create, which OpenRouter does not serve.
-OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'qwen/qwen3-coder-flash')
+OPENAI_MODEL = DEFAULT_CODE_MODEL
+
+
+def _log_llm_failure(log, where, exc):
+    """Write an auth or API failure to the agent log and to stderr.
+
+    Chat helpers used to ``except Exception: pass``. A missing AWS key then
+    looked like an empty patch. The message is redacted before it is written.
+    """
+    message = redact_secrets(
+        f"LLM call failed in {where}: {type(exc).__name__}: {exc}"
+    )
+    try:
+        log(message)
+    except Exception as log_exc:
+        print(
+            redact_secrets(
+                f"LLM logger failed ({type(log_exc).__name__}: {log_exc})"
+            ),
+            file=sys.stderr,
+        )
+    print(message, file=sys.stderr)
 
 def process_tool_call(tools_dict, tool_name, tool_input):
     try:
@@ -36,7 +64,7 @@ def get_response_withtools(
     logging=None, max_retry=3
 ):
     try:
-        if 'claude' in model:
+        if uses_anthropic_messages(model):
             response = client.messages.create(
                 model=model,
                 messages=messages,
@@ -71,7 +99,7 @@ def check_for_tool_use(response, model=''):
     """
     Checks if the response contains a tool call.
     """
-    if 'claude' in model:
+    if uses_anthropic_messages(model):
         # Claude, check for stop_reason in response
         if response.stop_reason == "tool_use":
             tool_use_block = next(block for block in response.content if block.type == "tool_use")
@@ -114,7 +142,7 @@ def convert_tool_info(tool_info, model=None):
     """
     Converts tool_info from Claude format to the given model's format.
     """
-    if 'claude' in model:
+    if uses_anthropic_messages(model):
         # should have no change
         return {
             'name': tool_info['name'],
@@ -275,7 +303,7 @@ def convert_msg_history(msg_history, model=None):
     """
     Convert message history from the model-specific format to a generic format.
     """
-    if 'claude' in model:
+    if uses_anthropic_messages(model):
         return convert_msg_history_claude(msg_history)
     elif model.startswith('o3-'):
         return convert_msg_history_openai(msg_history)
@@ -333,14 +361,14 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
             # Check for next tool use
             tool_use = check_for_tool_use(response, model=client_model)
 
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_llm_failure(logging, "chat_with_agent_manualtools", exc)
 
     return new_msg_history
 
 def chat_with_agent_claude(
         msg,
-        model='bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0',
+        model=CLAUDE_MODEL,
         msg_history=None,
         logging=print,
     ):
@@ -422,8 +450,8 @@ def chat_with_agent_claude(
             ],
         })
 
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_llm_failure(logging, "chat_with_agent_claude", exc)
 
     return new_msg_history
 
@@ -509,14 +537,14 @@ def chat_with_agent_openai(
         # Get final response
         new_msg_history.append(response)
 
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_llm_failure(logging, "chat_with_agent_openai", exc)
 
     return new_msg_history
 
 def chat_with_agent(
     msg,
-    model=CLAUDE_MODEL,
+    model=OPENAI_MODEL,
     msg_history=None,
     logging=print,
     convert=False,  # Convert the message history to a generic format, so that msg_history can be used across models
@@ -524,7 +552,7 @@ def chat_with_agent(
     if msg_history is None:
         msg_history = []
 
-    if 'claude' in model:
+    if uses_anthropic_messages(model):
         # Claude models
         new_msg_history = chat_with_agent_claude(msg, model=model, msg_history=msg_history, logging=logging)
         conv_msg_history = convert_msg_history(new_msg_history, model=model)

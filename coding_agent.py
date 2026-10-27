@@ -6,7 +6,8 @@ from logging.handlers import RotatingFileHandler
 import os
 import threading
 
-from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+from llm import resolve_code_model
+from llm_withtools import chat_with_agent
 from utils.secret_redaction import (
     SecretRedactingFormatter,
     install_secret_redaction,
@@ -82,6 +83,7 @@ class AgenticSystem:
             test_description=None,
             self_improve=False,
             instance_id=None,
+            model=None,
         ):
         self.problem_statement = problem_statement
         self.git_tempdir = git_tempdir
@@ -90,7 +92,8 @@ class AgenticSystem:
         self.test_description = test_description
         self.self_improve = self_improve
         self.instance_id = instance_id if not self_improve else 'dgm'
-        self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+        self.code_model = resolve_code_model(self_improve=self_improve, explicit=model)
+        print(f"Coding agent model: {self.code_model}")
 
         # Initialize logger and store it in thread-local storage
         self.logger = setup_logger(chat_history_file)
@@ -186,6 +189,11 @@ def main():
     parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
     parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
     parser.add_argument('--instance_id', default=None, help='Instance ID for SWE issue')
+    parser.add_argument(
+        '--model',
+        default=None,
+        help='Coding-agent model id. Verify defaults to OpenRouter qwen/qwen3-coder-flash. Override with DGM_EVAL_MODEL.',
+    )
     args = parser.parse_args()
 
     # Process the repository
@@ -197,6 +205,7 @@ def main():
         test_description=args.test_description,
         self_improve=args.self_improve,
         instance_id=args.instance_id,
+        model=args.model,
     )
 
     # Run the agentic system to try to solve the problem

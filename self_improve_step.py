@@ -2,7 +2,7 @@ import argparse
 import datetime
 import json
 import os
-from llm import create_client, get_response_from_llm, extract_json_between_markers
+from llm import create_client, get_response_from_llm, extract_json_between_markers, llm_container_env
 from prompts.self_improvement_prompt import get_diagnose_prompt_polyglot, get_diagnose_prompt_swe, get_problem_description_prompt
 from prompts.diagnose_improvement_prompt import get_diagnose_improvement_prompt
 from prompts.testrepo_prompt import get_test_description
@@ -405,18 +405,7 @@ def self_improve(
     safe_log("Running self-improvement")
     chat_history_file_container = "/dgm/self_evo.md"
     test_description = get_test_description(swerepo=False)
-    env_vars = {
-        "ANTHROPIC_API_KEY": os.getenv('ANTHROPIC_API_KEY'),
-        "AWS_REGION": os.getenv('AWS_REGION'),
-        "AWS_REGION_NAME": os.getenv('AWS_REGION_NAME'),
-        "AWS_ACCESS_KEY_ID": os.getenv('AWS_ACCESS_KEY_ID'),
-        "AWS_SECRET_ACCESS_KEY": os.getenv('AWS_SECRET_ACCESS_KEY'),
-        "OPENAI_API_KEY": os.getenv('OPENAI_API_KEY'),
-        "OPENROUTER_API_KEY": os.getenv('OPENROUTER_API_KEY'),
-        "OPENAI_BASE_URL": os.getenv('OPENAI_BASE_URL'),
-        # Keep Improve backbone aligned with the host MVP default / launch export.
-        "OPENAI_MODEL": os.getenv('OPENAI_MODEL', 'qwen/qwen3-coder-flash'),
-    }
+    env_vars = llm_container_env()
     cmd = [
         "timeout", "1800",  # 30min timeout
         "python", "/dgm/coding_agent.py",
