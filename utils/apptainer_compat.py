@@ -1061,9 +1061,12 @@ class ApptainerContainer:
         sif = self._sif()
         if sandbox.exists():
             shutil.rmtree(sandbox, ignore_errors=True)
+        # Unpack can exceed the 600s client/exec timeout (esp. on NFS). Use the
+        # same build budget as Dockerfile sandbox builds, not client.timeout.
+        build_timeout = dockerfile_build_timeout(self.client.timeout)
         proc = _run_apptainer(
             ["build", "--sandbox", str(sandbox), str(sif)],
-            timeout=self.client.timeout,
+            timeout=build_timeout,
             check=False,
         )
         if proc.returncode != 0:

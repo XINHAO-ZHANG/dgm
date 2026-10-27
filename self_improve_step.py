@@ -207,7 +207,7 @@ def run_harness_polyglot(entry, model_name_or_path, patch_files, num_evals, outp
     dnames = polyglot_harness(
         test_task_list=test_task_list,
         num_samples=-1,
-        max_workers=min(10, len(test_task_list)),
+        max_workers=min(int(os.environ.get("DGM_EVAL_MAX_WORKERS", "10")), len(test_task_list)),
         model_name_or_path=model_name_or_path,
         model_patch_paths=patch_files,
         num_evals=num_evals,
@@ -230,7 +230,7 @@ def run_harness_polyglot(entry, model_name_or_path, patch_files, num_evals, outp
         dnames = polyglot_harness(
             test_task_list=test_task_list_more,
             num_samples=-1,
-            max_workers=50,
+            max_workers=min(int(os.environ.get("DGM_EVAL_MAX_WORKERS", "50")), max(1, len(test_task_list_more or []))),
             model_name_or_path=model_name_or_path,
             model_patch_paths=patch_files,
             num_evals=num_evals,
@@ -414,6 +414,8 @@ def self_improve(
         "OPENAI_API_KEY": os.getenv('OPENAI_API_KEY'),
         "OPENROUTER_API_KEY": os.getenv('OPENROUTER_API_KEY'),
         "OPENAI_BASE_URL": os.getenv('OPENAI_BASE_URL'),
+        # Keep Improve backbone aligned with the host MVP default / launch export.
+        "OPENAI_MODEL": os.getenv('OPENAI_MODEL', 'qwen/qwen3-coder-flash'),
     }
     cmd = [
         "timeout", "1800",  # 30min timeout

@@ -341,6 +341,57 @@ def test_dockerfile_build_defaults_to_7200_seconds(tmp_path, monkeypatch):
     assert seen["sif_wait_timeout"] == 7200
 
 
+
+def test_writable_rootfs_uses_build_timeout_not_client_timeout(tmp_path, monkeypatch):
+    """Eval sandbox unpack must not inherit the 600s client/exec timeout."""
+    from utils.apptainer_compat import ApptainerContainer, dockerfile_build_timeout
+
+    monkeypatch.delenv("APPTAINER_BUILD_TIMEOUT", raising=False)
+    monkeypatch.delenv("APPTAINER_API_TIMEOUT", raising=False)
+    monkeypatch.delenv("CONTAINER_API_TIMEOUT", raising=False)
+    monkeypatch.setenv("APPTAINER_WORKSPACE_ROOT", str(tmp_path / "ws"))
+
+    seen = {}
+
+    class FakeClient:
+        timeout = 600
+
+        class images:
+            @staticmethod
+            def ensure(ref, pull=True):
+                sif = tmp_path / "img.sif"
+                sif.write_bytes(b"sif")
+                return sif
+
+    def fake_run(args, timeout=None, check=False, **kwargs):
+        seen["args"] = list(args)
+        seen["timeout"] = timeout
+
+        class Proc:
+            returncode = 0
+            stdout = b""
+            stderr = b""
+
+        # Pretend build created a usable rootfs
+        rootfs = Path(args[args.index("--sandbox") + 1])
+        rootfs.mkdir(parents=True, exist_ok=True)
+        (rootfs / "bin").mkdir(exist_ok=True)
+        return Proc()
+
+    monkeypatch.setattr("utils.apptainer_compat._run_apptainer", fake_run)
+    c = ApptainerContainer(FakeClient(), "pb.eval.test:latest", "ctr1")
+    # Force missing sandbox so build runs
+    if c._workspace.exists():
+        import shutil
+        shutil.rmtree(c._workspace)
+    c._workspace.mkdir(parents=True, exist_ok=True)
+    from utils.host_resources import stamp_workspace
+    stamp_workspace(c._workspace, name="ctr1")
+    out = c._writable_rootfs()
+    assert out.is_dir()
+    assert seen["timeout"] == dockerfile_build_timeout(600) == 7200
+    assert seen["timeout"] != 600
+
 def test_copy_into_root_stays_visible_to_post_script(tmp_path, monkeypatch):
     """pb.env COPY ./setup_env.sh /root/ must still be there for the RUN chmod.
 

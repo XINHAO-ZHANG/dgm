@@ -11,6 +11,7 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import shutil
+from utils.fs_copy import copytree_for_build
 
 from polyglot.constants import (
     BASE_IMAGE_BUILD_DIR,
@@ -109,7 +110,8 @@ def build_image(
             local_folder = Path(repo)  # your source folder
             if local_folder.is_dir():
                 target_folder = build_dir / repo
-                shutil.copytree(local_folder, target_folder, dirs_exist_ok=True)
+                # dirs_exist_ok copytree fails on read-only git objects from a prior build.
+                copytree_for_build(local_folder, target_folder)
                 logger.info(f"Copied folder {local_folder} to {target_folder}")
 
         # Write the setup scripts to the build directory
