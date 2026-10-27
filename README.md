@@ -28,12 +28,14 @@ export OPENAI_API_KEY='...'
 export ANTHROPIC_API_KEY='...'
 ```
 
-OpenRouter serves the self-improve diagnose and coding calls. Put the OpenRouter key in `OPENAI_API_KEY` or `OPENROUTER_API_KEY`, and point the OpenAI client at OpenRouter. The Scalability MVP backbone is `qwen/qwen3-coder-flash` (chat completions). Anthropic stays optional for that path; non-self-improve SWE solving still uses Claude.
+OpenRouter serves self-improve and Verify (the coding agent that solves benchmark tasks). Put the OpenRouter key in `OPENAI_API_KEY` or `OPENROUTER_API_KEY`, and point the OpenAI client at OpenRouter. The Scalability MVP backbone is `qwen/qwen3-coder-flash` (chat completions) for both paths. `DGM_EVAL_MODEL` overrides Verify only. A `bedrock/…` id still uses Amazon Bedrock when `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_REGION_NAME` are set. Polyglot and SWE harnesses forward these variables into the Apptainer sandbox (`llm_container_env`); the benchmark SIF does not need a rebuild for that.
 
 ```bash
 export OPENAI_API_KEY='...'          # or OPENROUTER_API_KEY
-export OPENROUTER_API_KEY='...'      # forwarded into the self-improve container
+export OPENROUTER_API_KEY='...'      # forwarded into self-improve and Verify sandboxes
 export OPENAI_BASE_URL='https://openrouter.ai/api/v1'
+# optional Verify override (default is qwen/qwen3-coder-flash):
+# export DGM_EVAL_MODEL='qwen/qwen3-coder-flash'
 ```
 
 ```bash
@@ -110,7 +112,7 @@ The smoke command replays a fixed synthetic trace and writes:
 - `evopilot_state.json` — active agent, checkpoint bank, and evolution memory
 - `evopilot_summary.json` — AUEC numbers, salvage rate, and an explicit synthetic-run disclaimer
 
-Live Polyglot evolution uses the same self-improve container and Polyglot harness as DGM. It needs an OpenAI-compatible key (`OPENAI_API_KEY` or `OPENROUTER_API_KEY`), `pip install -r requirements.txt`, and `python -m polyglot.prepare_polyglot_dataset`. With `OPENAI_BASE_URL=https://openrouter.ai/api/v1`, diagnose and self-improve use `qwen/qwen3-coder-flash` and Anthropic is optional. The container runtime follows `DGM_CONTAINER_RUNTIME` (`auto`, `docker`, or `apptainer`). On bach4, select Apptainer. A Docker daemon is not required for that path. Image build and fakeroot notes are in [APPTAINER.md](APPTAINER.md).
+Live Polyglot evolution uses the same self-improve container and Polyglot harness as DGM. It needs an OpenAI-compatible key (`OPENAI_API_KEY` or `OPENROUTER_API_KEY`), `pip install -r requirements.txt`, and `python -m polyglot.prepare_polyglot_dataset`. With `OPENAI_BASE_URL=https://openrouter.ai/api/v1`, diagnose, self-improve, and Verify use `qwen/qwen3-coder-flash`. Anthropic and Bedrock are optional. The harness copies `coding_agent_polyglot.py`, `llm.py`, and `llm_withtools.py` into the sandbox on each task, so those files do not require a `pb.*` SIF rebuild. The self-improve `dgm` image is baked with `COPY . .`; rebuild that SIF (`--force_rebuild`) only to pick up agent changes inside Improve. The container runtime follows `DGM_CONTAINER_RUNTIME` (`auto`, `docker`, or `apptainer`). On bach4, select Apptainer. A Docker daemon is not required for that path. Image build and fakeroot notes are in [APPTAINER.md](APPTAINER.md).
 
 Polyglot Verify uses DGM's staged meter by default. No extra staging flag is required. The screen is `polyglot/subsets/small.json` (10). When `total_resolved_instances >= --eval_threshold * 10` (default `0.4`, so 4 resolved), the same candidate is also evaluated on `polyglot/subsets/medium.json` (50). That second stage is `overall_performance_deep` and counts toward cumulative task-evals. `--shallow_eval` is smoke only: it stays on the 10-problem screen and does not run medium. Accept and rollback use the screen, because every candidate finishes it; a small-set score is not compared with a medium-set or full-suite score. The cached full-suite accuracy is rescaled onto the screen from per-problem results.
 

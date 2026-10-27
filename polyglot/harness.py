@@ -27,6 +27,7 @@ from utils.host_resources import (
     verify_worker_block,
 )
 from utils.secret_redaction import redact_secrets
+from llm import llm_container_env, resolve_code_model
 
 from swe_bench.utils import (
     copy_to_container,
@@ -117,15 +118,8 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths):
         exec_result = container.exec_run("python -m pip install -r /dgm/requirements.txt", workdir='/')
         log_container_output(exec_result)
 
-        # Run the agent
-        env_vars = {
-            "ANTHROPIC_API_KEY": os.getenv('ANTHROPIC_API_KEY'),
-            "AWS_REGION": os.getenv('AWS_REGION'),
-            "AWS_REGION_NAME": os.getenv('AWS_REGION_NAME'),
-            "AWS_ACCESS_KEY_ID": os.getenv('AWS_ACCESS_KEY_ID'),
-            "AWS_SECRET_ACCESS_KEY": os.getenv('AWS_SECRET_ACCESS_KEY'),
-            "OPENAI_API_KEY": os.getenv('OPENAI_API_KEY'),
-        }
+        # Run the agent. Keys reach the sandbox through Apptainer --env-file.
+        env_vars = llm_container_env()
         safe_log("Running the agent")
         cmd = [
             "timeout", "600",  # 10 min timeout
@@ -137,6 +131,7 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths):
             "--outdir", "/dgm/",
             "--test_description", test_description,
             "--language", entry['language'],
+            "--model", resolve_code_model(self_improve=False),
         ]
         exec_result = container.exec_run(cmd, environment=env_vars, workdir='/testbed/')
         log_container_output(exec_result)
