@@ -7,6 +7,11 @@ import os
 import threading
 
 from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
+from utils.secret_redaction import (
+    SecretRedactingFormatter,
+    install_secret_redaction,
+    redact_secrets,
+)
 from utils.eval_utils import get_report_score, msg_history_to_report, score_tie_breaker
 from utils.git_utils import diff_versus_commit, reset_to_commit, ensure_trailing_newline, apply_patch
 
@@ -38,7 +43,7 @@ def setup_logger(log_file='./chat_history.md', level=logging.INFO):
     logger.handlers = []
     
     # Create formatters
-    file_formatter = logging.Formatter('%(message)s')
+    file_formatter = SecretRedactingFormatter('%(message)s')
     
     # Create and set up file handler
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
@@ -48,6 +53,7 @@ def setup_logger(log_file='./chat_history.md', level=logging.INFO):
     
     # Add handlers to logger
     logger.addHandler(file_handler)
+    install_secret_redaction(logger)
     
     # Store logger in thread-local storage
     set_thread_logger(logger)
@@ -57,7 +63,9 @@ def setup_logger(log_file='./chat_history.md', level=logging.INFO):
 def safe_log(message, level=logging.INFO):
     """
     Thread-safe logging function that ensures messages go to the correct logger.
+    Secret values are redacted before they are written.
     """
+    message = redact_secrets(message)
     logger = get_thread_logger()
     if logger:
         logger.log(level, message)

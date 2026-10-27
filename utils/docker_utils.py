@@ -7,6 +7,11 @@ import tarfile
 from typing import Optional, Union
 
 from utils import apptainer_errors as container_errors
+from utils.secret_redaction import (
+    SecretRedactingFormatter,
+    install_secret_redaction,
+    redact_secrets,
+)
 
 # Thread-local storage for loggers
 _thread_local = threading.local()
@@ -40,12 +45,14 @@ def setup_logger(log_file):
     handler.setLevel(logging.INFO)
     handler.stream.lock = threading.Lock()
     
-    # Create formatter
-    formatter = logging.Formatter('%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
+    # Create formatter. The formatter and filter both drop secret values so
+    # a failure string that still contains an API key is not written to disk.
+    formatter = SecretRedactingFormatter('%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
     handler.setFormatter(formatter)
     
     # Add handler to logger
     logger.addHandler(handler)
+    install_secret_redaction(logger)
     
     # Store logger in thread local storage
     _thread_local.logger = logger
@@ -53,7 +60,8 @@ def setup_logger(log_file):
     return logger
 
 def safe_log(message: str, level: int = logging.INFO):
-    """Thread-safe logging function."""
+    """Thread-safe logging function. Secret values are redacted first."""
+    message = redact_secrets(message)
     logger = get_thread_logger()
     if logger:
         logger.log(level, message)

@@ -599,6 +599,94 @@ def test_build_skips_existing_sif_unless_nocache(tmp_path, monkeypatch):
     assert sif.read_bytes() == b"old"
 
 
+_SECRET_ENV = {
+    "OPENROUTER_API_KEY": "sk-or-v1-supersecretvalue",
+    "OPENAI_API_KEY": "sk-proj-openaikeyvalue1234",
+    "AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG",
+    "ANTHROPIC_API_KEY": None,
+    "OPENAI_BASE_URL": "https://openrouter.ai/api/v1",
+    "AWS_REGION": "us-west-2",
+}
+
+
+def _exec_container(name: str):
+    client = ApptainerClient(timeout=5)
+    container = client.containers.create(
+        image="alpine:latest",
+        name=name,
+        command="tail -f /dev/null",
+    )
+    (container._workspace / "rootfs" / "bin").mkdir(parents=True)
+    return container
+
+
+@pytest.mark.parametrize("outcome", ["ok", "timeout", "failed", "nonzero"])
+def test_exec_env_file_keeps_secrets_off_argv(monkeypatch, outcome):
+    """Timeouts and failed execs must not stringify secret values.
+
+    Secrets are present only in the mode-0600 env file while the command
+    runs, and that file is removed when the command returns or raises.
+    """
+    container = _exec_container(f"env-file-{outcome}")
+    observed = {}
+
+    def fake_run(cmd, capture_output=True, timeout=None, **kwargs):
+        argv = [str(part) for part in cmd]
+        env_path = Path(argv[argv.index("--env-file") + 1])
+        observed["argv"] = argv
+        observed["path"] = env_path
+        observed["text"] = env_path.read_text(encoding="utf-8")
+        observed["mode"] = env_path.stat().st_mode & 0o777
+        observed["existed_during"] = env_path.is_file()
+        if outcome == "timeout":
+            raise subprocess.TimeoutExpired(cmd, timeout or 1)
+        if outcome == "failed":
+            raise subprocess.CalledProcessError(1, cmd, output=b"fail")
+        code = 0 if outcome == "ok" else 1
+        return subprocess.CompletedProcess(cmd, code, stdout=b"ok", stderr=b"")
+
+    monkeypatch.setattr("utils.apptainer_compat.subprocess.run", fake_run)
+    command = ["python", "/dgm/coding_agent.py", "--self_improve"]
+    leaked = ""
+    if outcome == "timeout":
+        with pytest.raises(subprocess.TimeoutExpired) as caught:
+            container.exec_run(command, environment=_SECRET_ENV, workdir="/")
+        leaked = str(caught.value) + "\n" + repr(caught.value)
+        leaked += "\n" + " ".join(str(part) for part in caught.value.cmd)
+    elif outcome == "failed":
+        with pytest.raises(subprocess.CalledProcessError) as caught:
+            container.exec_run(command, environment=_SECRET_ENV, workdir="/")
+        leaked = str(caught.value) + "\n" + repr(caught.value)
+        leaked += "\n" + " ".join(str(part) for part in caught.value.cmd)
+    else:
+        result = container.exec_run(command, environment=_SECRET_ENV, workdir="/")
+        assert result.exit_code == (0 if outcome == "ok" else 1)
+
+    argv = observed["argv"]
+    argv_text = "\n".join(argv)
+    assert observed["existed_during"] is True
+    assert observed["mode"] == 0o600
+    assert "--env" not in argv
+    assert "--env-file" in argv
+    assert "OPENROUTER_API_KEY=sk-or-v1-supersecretvalue" in observed["text"]
+    assert "OPENAI_API_KEY=sk-proj-openaikeyvalue1234" in observed["text"]
+    assert "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG" in observed["text"]
+    assert "OPENAI_BASE_URL=https://openrouter.ai/api/v1" in observed["text"]
+    assert "AWS_REGION=us-west-2" in observed["text"]
+    assert "ANTHROPIC_API_KEY" not in observed["text"]
+    for secret in (
+        "sk-or-v1-supersecretvalue",
+        "sk-proj-openaikeyvalue1234",
+        "wJalrXUtnFEMI/K7MDENG",
+    ):
+        assert secret not in argv_text
+        assert secret not in leaked
+    assert "us-west-2" not in argv_text
+    assert "https://openrouter.ai/api/v1" not in argv_text
+    assert not observed["path"].exists()
+    assert list(container._workspace.glob("apptainer-env-*")) == []
+
+
 def test_recreate_container_clears_workspace():
     client = ApptainerClient(timeout=5)
     first = client.containers.create(image="alpine:latest", name="again")

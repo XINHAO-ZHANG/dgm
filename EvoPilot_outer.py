@@ -32,6 +32,7 @@ from evopilot.scoring import partition, verify_schedule
 from evopilot.smoke import DRY_RUN_DISCLAIMER, run_smoke
 from evopilot.types import AgentSnapshot, Decision, VerificationEvidence
 from utils.common_utils import load_json_file
+from utils.secret_redaction import redact_secrets
 
 LIVE_DISCLAIMER = (
     "Log of this EvoPilot run. AUEC uses evaluation counts from this process only. "
@@ -153,7 +154,7 @@ def failure_metadata(parent_id: str, entry: str | None, exc: BaseException) -> d
         "model_patch_notempty": False,
         "evopilot_structural": True,
         "evopilot_failure_cluster": "infrastructure_error",
-        "error": repr(exc),
+        "error": redact_secrets(repr(exc)),
         "overall_performance": {},
     }
 

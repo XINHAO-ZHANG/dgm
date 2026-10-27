@@ -14,6 +14,7 @@ from dataclasses import replace
 
 from evopilot.scoring import partition
 from evopilot.types import AgentSnapshot, VerificationEvidence
+from utils.secret_redaction import redact_secrets
 
 
 def parse_diff_paths(diff_text: str) -> tuple[str, ...]:
@@ -229,7 +230,7 @@ def evidence_from_dgm_metadata(
         variance = variance_from_result_files(results_dir, str(metadata.get("run_id") or ""))
     notes = ""
     if metadata.get("error"):
-        notes = str(metadata.get("error"))[:500]
+        notes = redact_secrets(metadata.get("error"))[:500]
     return VerificationEvidence(
         candidate_id=str(metadata.get("run_id") or "unknown"),
         base_agent_id=base.agent_id,

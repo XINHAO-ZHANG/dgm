@@ -4,13 +4,24 @@ import json
 import math
 import os
 import random
+import traceback
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, TimeoutError
 
 from prompts.self_improvement_prompt import find_selfimprove_eval_logs
-from self_improve_step import self_improve
 from utils.common_utils import load_json_file
 from utils.docker_utils import setup_logger
 from utils.evo_utils import load_dgm_metadata, is_compiled_self_improve
+from utils.secret_redaction import redact_secrets
+
+
+def log_selfimprove_failure(logger, exc: BaseException) -> None:
+    """Write a self-improve failure to the outer log without secret values.
+
+    ``subprocess.TimeoutExpired`` and ``CalledProcessError`` include argv in
+    ``str(exc)`` and in the traceback. Redact before either line is logged.
+    """
+    logger.error("Self-improvement step failed: %s", redact_secrets(str(exc)))
+    logger.error("Traceback:\n%s", redact_secrets(traceback.format_exc()))
 
 def initialize_run(output_dir, prevrun_dir=None, polyglot=False):
     # Initialize archive
@@ -219,6 +230,9 @@ def get_full_eval_threshold(output_dir, archive):
     return threshold
 
 def main():
+    # Imported here so the failure logger can be unit-tested without the model stack.
+    from self_improve_step import self_improve
+
     parser = argparse.ArgumentParser(description="Darwin Godel Machine!")
     parser.add_argument("--max_generation", type=int, default=80, help="Maximum number of evolution iterations.")
     parser.add_argument("--selfimprove_size", type=int, default=2, help="Number of self-improvements attempts per DGM generation.")
@@ -308,9 +322,7 @@ def main():
                     logger.error("Self-improvement attempt timed out.")
                     future.cancel()  # Optionally cancel the future if it's still running
                 except Exception as e:
-                    import traceback
-                    logger.error(f"Self-improvement step failed: {e}")
-                    logger.error(f"Traceback:\n{traceback.format_exc()}")
+                    log_selfimprove_failure(logger, e)
 
         # Update archive
         logger.info(f"Updating archive for generation {gen_num}")
