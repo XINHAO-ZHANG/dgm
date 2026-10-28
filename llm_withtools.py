@@ -22,6 +22,9 @@ CLAUDE_MODEL = 'bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0'
 # OpenRouter chat-completions id for the Scalability MVP backbone.
 # o3 uses client.responses.create, which OpenRouter does not serve.
 OPENAI_MODEL = DEFAULT_CODE_MODEL
+# Consecutive broken <tool_use> blocks sent back to the model before the
+# manual tool loop stops. A successful parse resets the count.
+MAX_MANUAL_TOOL_PARSE_RETRIES = 2
 
 
 def _log_llm_failure(log, where, exc):
@@ -43,6 +46,72 @@ def _log_llm_failure(log, where, exc):
             file=sys.stderr,
         )
     print(message, file=sys.stderr)
+
+
+class ToolUseParseError(Exception):
+    """A ``<tool_use>`` block was present but could not be turned into a tool call."""
+
+
+def _short_exc(exc, limit=300):
+    text = " ".join(f"{type(exc).__name__}: {exc}".split())
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
+
+
+def _parse_manual_tool_payload(body):
+    """Parse a manual ``<tool_use>`` body into a tool-call dict.
+
+    A successful ``ast.literal_eval`` is returned as-is. ``json.loads`` runs
+    only when ``literal_eval`` cannot parse the body, which covers JSON
+    ``true`` / ``false`` / ``null``.
+    """
+    candidates = []
+    problems = []
+    try:
+        candidates.append(("ast.literal_eval", ast.literal_eval(body)))
+    except Exception as exc:
+        problems.append(f"ast.literal_eval: {_short_exc(exc)}")
+        try:
+            candidates.append(("json.loads", json.loads(body)))
+        except Exception as json_exc:
+            problems.append(f"json.loads: {_short_exc(json_exc)}")
+
+    for name, value in candidates:
+        if isinstance(value, dict) and "tool_name" in value and "tool_input" in value:
+            return value
+        problems.append(
+            f"{name}: expected a dict with 'tool_name' and 'tool_input', "
+            f"got {type(value).__name__}"
+        )
+
+    preview = body[:120].replace("\n", "\\n")
+    if len(body) > 120:
+        preview += f"... ({len(body)} chars total)"
+    detail = " ".join(problems) if problems else "empty tool block"
+    raise ToolUseParseError(
+        "Tool use parse failed: the <tool_use> block was detected but not "
+        f"executed ({detail}). Body starts with {preview!r}. "
+        "Resend one <tool_use> block whose body is a Python dict literal "
+        "or a JSON object with keys 'tool_name' and 'tool_input'. "
+        "Keep braces balanced and escape quotes and newlines inside strings."
+    )
+
+
+def _log_tool_parse_failure(log, message):
+    """Write a manual tool-parse failure to the agent log and to stderr."""
+    redacted = redact_secrets(message)
+    try:
+        log(redacted)
+    except Exception as log_exc:
+        print(
+            redact_secrets(
+                f"Tool use parse logger failed ({type(log_exc).__name__}: {log_exc})"
+            ),
+            file=sys.stderr,
+        )
+    print(redacted, file=sys.stderr)
+
 
 def process_tool_call(tools_dict, tool_name, tool_input):
     try:
@@ -98,6 +167,9 @@ def get_response_withtools(
 def check_for_tool_use(response, model=''):
     """
     Checks if the response contains a tool call.
+
+    A manual ``<tool_use>`` block that is present but unparsable raises
+    ``ToolUseParseError``. It is not reported as "no tool".
     """
     if uses_anthropic_messages(model):
         # Claude, check for stop_reason in response
@@ -127,13 +199,7 @@ def check_for_tool_use(response, model=''):
         pattern = r'<tool_use>(.*?)</tool_use>'
         match = re.search(pattern, response, re.DOTALL)
         if match:
-            tool_use_str = match.group(1).strip()
-            try:
-                tool_use_dict = ast.literal_eval(tool_use_str)
-                if isinstance(tool_use_dict, dict) and 'tool_name' in tool_use_dict and 'tool_input' in tool_use_dict:
-                    return tool_use_dict
-            except Exception:
-                pass
+            return _parse_manual_tool_payload(match.group(1).strip())
 
     # No tool use found
     return None
@@ -337,17 +403,34 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
         )
         logging(f"Output: {response}")
 
-        # Tool use
-        tool_use = check_for_tool_use(response, model=client_model)
-        while tool_use:
-            # Process tool call
-            tool_name = tool_use['tool_name']
-            tool_input = tool_use['tool_input']
-            tool_result = process_tool_call(tools_dict, tool_name, tool_input)
+        # Tool use. A detected <tool_use> block that fails to parse is sent
+        # back so the model can correct it, instead of ending the turn.
+        parse_failures = 0
+        while True:
+            try:
+                tool_use = check_for_tool_use(response, model=client_model)
+            except ToolUseParseError as exc:
+                parse_failures += 1
+                tool_msg = str(exc)
+                _log_tool_parse_failure(logging, tool_msg)
+                if parse_failures > MAX_MANUAL_TOOL_PARSE_RETRIES:
+                    _log_tool_parse_failure(
+                        logging,
+                        "Tool use parse failed: stopping after "
+                        f"{MAX_MANUAL_TOOL_PARSE_RETRIES} correction attempts. "
+                        "The last <tool_use> block was not executed.",
+                    )
+                    break
+            else:
+                if not tool_use:
+                    break
+                parse_failures = 0
+                tool_name = tool_use['tool_name']
+                tool_input = tool_use['tool_input']
+                tool_result = process_tool_call(tools_dict, tool_name, tool_input)
+                tool_msg = f'Tool Used: {tool_name}\nTool Input: {tool_input}\nTool Result: {tool_result}'
+                logging(tool_msg)
 
-            # Get tool response
-            tool_msg = f'Tool Used: {tool_name}\nTool Input: {tool_input}\nTool Result: {tool_result}'
-            logging(tool_msg)
             response, new_msg_history = get_response_from_llm(
                 msg=tool_msg,
                 client=client,
@@ -357,9 +440,6 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
                 msg_history=new_msg_history,
             )
             logging(f"Output: {response}")
-
-            # Check for next tool use
-            tool_use = check_for_tool_use(response, model=client_model)
 
     except Exception as exc:
         _log_llm_failure(logging, "chat_with_agent_manualtools", exc)
