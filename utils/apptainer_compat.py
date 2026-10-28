@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
@@ -930,6 +931,84 @@ class ApptainerImages:
         sif.with_suffix(".json").write_text(json.dumps(meta), encoding="utf-8")
 
 
+def _env_file_lines(environment: Optional[Dict[str, str]]) -> List[str]:
+    """KEY=VALUE lines for Apptainer ``--env-file``. ``None`` values are skipped."""
+    lines: List[str] = []
+    for key, val in (environment or {}).items():
+        if val is None:
+            continue
+        key_s = str(key)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key_s):
+            raise ValueError(f"invalid container env name: {key_s!r}")
+        val_s = str(val)
+        if "\n" in val_s or "\r" in val_s or "\x00" in val_s:
+            raise ValueError(f"container env {key_s} contains a newline or NUL")
+        lines.append(f"{key_s}={val_s}\n")
+    return lines
+
+
+def _write_env_file(
+    environment: Optional[Dict[str, str]],
+    directory: Optional[os.PathLike] = None,
+) -> Optional[str]:
+    """Write container env to a mode-0600 file. Caller deletes it.
+
+    ``mkstemp`` requests mode 0600. ``chmod`` runs again so a restrictive
+    umask cannot leave the owner without read/write, and so the mode stays
+    0600 after the write.
+    """
+    lines = _env_file_lines(environment)
+    if not lines:
+        return None
+    fd, path = tempfile.mkstemp(
+        prefix="apptainer-env-",
+        suffix=".env",
+        dir=None if directory is None else str(directory),
+    )
+    try:
+        os.chmod(path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.writelines(lines)
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o600)
+        os.chmod(path, 0o600)
+        return path
+    except Exception:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
+def _unlink_env_file(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _container_env_file(
+    environment: Optional[Dict[str, str]],
+    directory: Optional[os.PathLike] = None,
+):
+    """Yield an env-file path that exists only for the duration of the command."""
+    path = _write_env_file(environment, directory=directory)
+    try:
+        yield path
+    finally:
+        _unlink_env_file(path)
+
+
 class ApptainerContainer:
     def __init__(
         self,
@@ -955,6 +1034,11 @@ class ApptainerContainer:
         if self._workspace.exists():
             shutil.rmtree(self._workspace, ignore_errors=True)
         self._workspace.mkdir(parents=True, exist_ok=True)
+        # Owner marker only. Cleanup after a generation removes this run's
+        # directories and leaves every other marker (and unmarked dirs) in place.
+        from utils.host_resources import stamp_workspace
+
+        stamp_workspace(self._workspace, name=name)
         self._binds: Dict[str, Path] = {}
         self._started = False
         self._instance_name: Optional[str] = None
@@ -977,9 +1061,12 @@ class ApptainerContainer:
         sif = self._sif()
         if sandbox.exists():
             shutil.rmtree(sandbox, ignore_errors=True)
+        # Unpack can exceed the 600s client/exec timeout (esp. on NFS). Use the
+        # same build budget as Dockerfile sandbox builds, not client.timeout.
+        build_timeout = dockerfile_build_timeout(self.client.timeout)
         proc = _run_apptainer(
             ["build", "--sandbox", str(sandbox), str(sif)],
-            timeout=self.client.timeout,
+            timeout=build_timeout,
             check=False,
         )
         if proc.returncode != 0:
@@ -1015,7 +1102,7 @@ class ApptainerContainer:
     def _exec_base_args(
         self,
         workdir: Optional[str] = None,
-        environment: Optional[Dict[str, str]] = None,
+        env_file: Optional[str] = None,
     ) -> List[str]:
         args = _exec_prefix()
         if _use_nv():
@@ -1027,9 +1114,13 @@ class ApptainerContainer:
         args.extend(self._bind_args())
         if workdir:
             args.extend(["--pwd", workdir])
-        for key, val in (environment or {}).items():
-            if val is not None:
-                args.extend(["--env", f"{key}={val}"])
+        # Do not put KEY=value on argv. TimeoutExpired and CalledProcessError
+        # stringify the command, and that string is what DGM_outer logs.
+        # Apptainer reads the same variables from --env-file. Docker call
+        # sites still pass an environment dict; only this shim was copying
+        # those values onto the command line.
+        if env_file:
+            args.extend(["--env-file", env_file])
         args.append(str(self._writable_rootfs()))
         return args
 
@@ -1078,17 +1169,19 @@ class ApptainerContainer:
             run_cmd = ["/bin/sh", "-c", cmd]
         run_cmd = self._wrap_user_cmd(run_cmd, user=kwargs.get("user", self._user))
 
-        with self._lock:
-            sandbox = self._writable_rootfs()
-            self._prepare_sandbox_bind_targets(sandbox)
-            base = self._exec_base_args(workdir=workdir, environment=environment)
-            full_cmd = [get_apptainer_bin()] + base + run_cmd
-            proc = subprocess.run(
-                full_cmd,
-                capture_output=True,
-                timeout=self.client.timeout,
-            )
-        return ExecResult(exit_code=proc.returncode, output=proc.stdout + proc.stderr)
+        # The env file is removed when the command returns, times out, or raises.
+        with _container_env_file(environment, directory=self._workspace) as env_file:
+            with self._lock:
+                sandbox = self._writable_rootfs()
+                self._prepare_sandbox_bind_targets(sandbox)
+                base = self._exec_base_args(workdir=workdir, env_file=env_file)
+                full_cmd = [get_apptainer_bin()] + base + run_cmd
+                proc = subprocess.run(
+                    full_cmd,
+                    capture_output=True,
+                    timeout=self.client.timeout,
+                )
+            return ExecResult(exit_code=proc.returncode, output=proc.stdout + proc.stderr)
 
     def put_archive(self, path: str, data: bytes) -> bool:
         dest_dir = path.rstrip("/") or "/"

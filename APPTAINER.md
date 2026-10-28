@@ -85,6 +85,27 @@ Unprivileged Apptainer already shares the host network, which `pip` and model AP
 
 The Dockerfile post script does **not** use `--contain`. With `--fakeroot`, that flag mounts an empty directory over `/root` and hides files `COPY` just placed there. `pb.env` then fails with `chmod: cannot access '/root/setup_env.sh'`. The post script uses `--writable`, `--no-home`, and `--no-mount tmp,home,cwd` so sandbox `/root` (conda, rustup, `setup_env.sh`) and `/tmp` stay visible. `APPTAINER_CONTAIN` does not change that build step.
 
+## Shared-host resource gate
+
+`DGM_outer.py` and `EvoPilot_outer.py` check the host before Improve (the model call) and before Verify (another Apptainer sandbox). A failing check returns immediately: no OpenRouter call and no new sandbox.
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--min-tmp-free-gb` | 10 | Free space required on `/tmp` and on any distinct `TMPDIR`, `APPTAINER_TMPDIR`, or `APPTAINER_WORKSPACE_ROOT`. `0` disables the disk check. |
+| `--min-available-mem-gb` | 4 | `MemAvailable` floor. `0` disables it. |
+| `--max-mem-pressure` | 10 | Maximum `/proc/pressure/memory` `full` avg10, in percent. Negative disables the check. A missing PSI file is ignored. |
+| `--continue-on-infra-error` | off | After nospace, memory, LDAP/userid, or Apptainer start failure, start the next generation. The disk and memory gates still apply. |
+| `--dry-resource-check` | off | Print the snapshot and exit `0` when the gates would allow a generation, or `2` when they would refuse it. |
+
+Exit code `2` also means a live run stopped for one of those reasons. The summary field is `infra_error_code` (`resource_exhausted_disk`, `resource_exhausted_memory`, `resource_exhausted_memory_pressure`, `infra_nospace`, `infra_memory`, `infra_ldap_userid`, `infra_apptainer_start`). An empty or bad patch is not one of these codes; accept and rollback stay on the controller.
+
+Each sandbox directory under `APPTAINER_WORKSPACE_ROOT` (default `$TMPDIR/apptainer-workspaces`) gets a `.dgm-workspace-owner` marker for that output directory. At the end of a generation the run deletes only directories with its own marker. Unmarked directories and other owners stay, including other users and a second arm of the same experiment.
+
+```bash
+python3 EvoPilot_outer.py --dry-resource-check
+python3 DGM_outer.py --dry-resource-check --polyglot
+```
+
 ## Smoke test
 
 No dataset and no API key:

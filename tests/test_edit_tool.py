@@ -83,3 +83,39 @@ class TestEditorTool:
         """Test various invalid commands."""
         result = tool_function(command, str(sample_file))
         assert "Error" in result
+
+
+class TestEditorViewRange:
+    def test_view_range_slice(self, sample_file):
+        result = tool_function("view", str(sample_file), view_range=[2, 4])
+        assert "Error" not in result
+        assert "line 2" in result
+        assert "line 3" in result
+        assert "line 4" in result
+        assert "line 1" not in result
+        assert "line 5" not in result
+        # Line numbers should start at the requested start_line
+        assert "     2\tline 2" in result
+
+    def test_view_range_to_eof(self, sample_file):
+        result = tool_function("view", str(sample_file), view_range=[4, -1])
+        assert "Error" not in result
+        assert "line 4" in result
+        assert "line 5" in result
+        assert "line 1" not in result
+
+    def test_view_range_ignored_for_directory(self, temp_dir):
+        (temp_dir / "a.txt").touch()
+        result = tool_function("view", str(temp_dir), view_range=[1, 2])
+        assert "Error" not in result
+        assert "files and directories" in result
+        assert "a.txt" in result
+
+    def test_view_without_view_range_still_works(self, sample_file):
+        result = tool_function("view", str(sample_file))
+        assert "line 1" in result
+        assert "line 5" in result
+
+    def test_view_range_invalid_start(self, sample_file):
+        result = tool_function("view", str(sample_file), view_range=[0, 2])
+        assert "Error" in result

@@ -37,3 +37,6 @@ prompts/self_improvement_prompt.py
 prompts/diagnose_improvement_prompt.py
 utils/evo_utils.py
 utils/docker_utils.py
+venv/
+output_evopilot/
+output_polyglot_dry/

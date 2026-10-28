@@ -2,15 +2,14 @@ import argparse
 import datetime
 import json
 import os
-from llm import create_client, get_response_from_llm, extract_json_between_markers
+from llm import create_client, get_response_from_llm, extract_json_between_markers, llm_container_env
 from prompts.self_improvement_prompt import get_diagnose_prompt_polyglot, get_diagnose_prompt_swe, get_problem_description_prompt
 from prompts.diagnose_improvement_prompt import get_diagnose_improvement_prompt
 from prompts.testrepo_prompt import get_test_description
-from swe_bench.harness import harness
-from polyglot.harness import harness as polyglot_harness
 from swe_bench.report import make_report
 from utils.common_utils import load_json_file
 from utils.evo_utils import get_model_patch_paths, get_all_performance, is_compiled_self_improve
+from utils.git_utils import prepare_model_patch
 from utils.docker_utils import (
     build_dgm_container,
     cleanup_container,
@@ -22,9 +21,20 @@ from utils.docker_utils import (
     safe_log,
     docker_from_env,
 )
+from utils.host_resources import (
+    InfraEvalError,
+    ResourceGateError,
+    apply_infra_metadata,
+    classify_infra_error,
+    require_resources_from_env,
+)
+from utils.secret_redaction import redact_secrets
 
 dataset = None
-diagnose_model = 'o1-2024-12-17'
+diagnose_model = 'qwen/qwen3-coder-flash'
+# Imported on first Polyglot Verify so a resource-gate unit test does not
+# need the SWE-bench package. Tests may replace this with a fake harness.
+polyglot_harness = None
 
 def diagnose_problem(entry, commit, root_dir, out_dir, patch_files=[], max_attempts=3, polyglot=False):
     client = create_client(diagnose_model)
@@ -122,6 +132,9 @@ def save_metadata(metadata, output_dir):
         json.dump(metadata, f, indent=4)
 
 def run_harness_swe(entry, model_name_or_path, patch_files, num_evals, output_dir, metadata, run_id, test_more_threshold, test_task_list, test_task_list_more):
+    from swe_bench.harness import harness
+
+    require_resources_from_env(phase="verify")
     safe_log('Start harness')
     test_task_list = [entry] if test_task_list is None else test_task_list
     dnames = harness(
@@ -153,6 +166,7 @@ def run_harness_swe(entry, model_name_or_path, patch_files, num_evals, output_di
         test_more_threshold is not None and test_task_list_more is not None and \
             overall_performance.get('total_resolved_instances', 0) >= len(test_task_list) * test_more_threshold):
         safe_log("Start additional evaluation cycle")
+        require_resources_from_env(phase="verify")
         dnames = harness(
             test_task_list=test_task_list_more,
             num_samples=-1,
@@ -176,14 +190,24 @@ def run_harness_swe(entry, model_name_or_path, patch_files, num_evals, output_di
         metadata['overall_performance'] = overall_performance
         safe_log("End of evaluation more")
 
+def _load_polyglot_harness():
+    global polyglot_harness
+    if polyglot_harness is None:
+        from polyglot.harness import harness as loaded
+        polyglot_harness = loaded
+    return polyglot_harness
+
+
 def run_harness_polyglot(entry, model_name_or_path, patch_files, num_evals, output_dir, metadata, run_id, test_more_threshold, test_task_list, test_task_list_more):
+    require_resources_from_env(phase="verify")
+    harness_fn = _load_polyglot_harness()
     safe_log('Start harness')
     test_task_list = [entry] if test_task_list is None else test_task_list
     safe_log(f'workers {min(10, len(test_task_list))}')
     dnames = polyglot_harness(
         test_task_list=test_task_list,
         num_samples=-1,
-        max_workers=min(10, len(test_task_list)),
+        max_workers=min(int(os.environ.get("DGM_EVAL_MAX_WORKERS", "10")), len(test_task_list)),
         model_name_or_path=model_name_or_path,
         model_patch_paths=patch_files,
         num_evals=num_evals,
@@ -202,10 +226,11 @@ def run_harness_polyglot(entry, model_name_or_path, patch_files, num_evals, outp
         test_more_threshold is not None and test_task_list_more is not None and \
             overall_performance.get('total_resolved_instances', 0) >= len(test_task_list) * test_more_threshold):
         safe_log("Start additional evaluation cycle")
+        require_resources_from_env(phase="verify")
         dnames = polyglot_harness(
             test_task_list=test_task_list_more,
             num_samples=-1,
-            max_workers=50,
+            max_workers=min(int(os.environ.get("DGM_EVAL_MAX_WORKERS", "50")), max(1, len(test_task_list_more or []))),
             model_name_or_path=model_name_or_path,
             model_patch_paths=patch_files,
             num_evals=num_evals,
@@ -233,17 +258,14 @@ def self_improve(
     full_eval_threshold=None,
     # Run baseline
     run_baseline=None,
-    polyglot=False
+    polyglot=False,
+    # Optional hooks for EvoPilot_outer. DGM_outer does not pass these.
+    problem_statement_override=None,
+    problem_statement_suffix=None,
+    evopilot_role=None,
 ):  
 
     global dataset
-    if polyglot:
-        with open("polyglot/polyglot_benchmark_metadata.json") as f:
-            dataset = json.loads(f.read())
-    else:
-        from datasets import load_dataset
-        dataset = load_dataset("princeton-nlp/SWE-bench_Verified")
-        dataset = dataset['test']
 
     # Variables for this self-improvement attempt
     metadata = {}
@@ -254,23 +276,59 @@ def self_improve(
     os.makedirs(output_dir, exist_ok=True)
     metadata['run_id'] = run_id
     metadata['parent_commit'] = parent_commit
+    if evopilot_role:
+        metadata['evopilot_role'] = evopilot_role
     test_task_list_big = load_json_file("./swe_bench/subsets/big.json")
 
     # Set up logger
     logger = setup_logger(os.path.join(output_dir, "self_improve.log"))
 
+    # Disk and memory are checked before the improve container and before
+    # diagnose, which is the first model call for this attempt.
+    try:
+        require_resources_from_env(phase="improve")
+    except ResourceGateError as exc:
+        apply_infra_metadata(metadata, exc.code, str(exc))
+        safe_log(f"Skipping improve: {metadata['error']}")
+        save_metadata(metadata, output_dir)
+        return metadata
+
+    # Dataset load can download or read a large cache. It stays after the
+    # gate so a full disk does not start that work or the model.
+    if polyglot:
+        with open("polyglot/polyglot_benchmark_metadata.json") as f:
+            dataset = json.loads(f.read())
+    else:
+        from datasets import load_dataset
+        dataset = load_dataset("princeton-nlp/SWE-bench_Verified")
+        dataset = dataset['test']
+
     # Create and start the Docker container
     image_name = "dgm"
     container_name = f"dgm-container-{run_id}"
-    client = docker_from_env()
-    # Remove any existing container with the same name
-    remove_existing_container(client, container_name)
-    # Now create and start the container
-    container = build_dgm_container(
-        client, root_dir, image_name, container_name,
-        force_rebuild=force_rebuild,
-    )
-    container.start()
+    container = None
+    try:
+        client = docker_from_env()
+        # Remove any existing container with the same name
+        remove_existing_container(client, container_name)
+        # Now create and start the container
+        container = build_dgm_container(
+            client, root_dir, image_name, container_name,
+            force_rebuild=force_rebuild,
+        )
+        container.start()
+    except Exception as exc:
+        text = f"{type(exc).__name__}: {exc}"
+        code = classify_infra_error(text) or "infra_apptainer_start"
+        apply_infra_metadata(metadata, code, text)
+        safe_log(f"Apptainer/container start failed: {metadata['error']}")
+        if container is not None:
+            try:
+                cleanup_container(container)
+            except Exception as cleanup_error:
+                safe_log(f"Error cleaning up container after start failure: {cleanup_error}")
+        save_metadata(metadata, output_dir)
+        return metadata
 
     if polyglot:
         # remove the swe version of coding_agent.py
@@ -311,8 +369,12 @@ def self_improve(
     exec_result = container.exec_run("python -m pip install -r /dgm/requirements.txt", workdir='/')
     log_container_output(exec_result)
 
-    # Get tasks to improve
-    if entry:
+    # Get tasks to improve. An override skips the extra diagnose call so a
+    # recovery debug can pass evidence already collected by the controller.
+    if problem_statement_override:
+        safe_log("Using problem_statement override")
+        problem_statement = problem_statement_override
+    elif entry:
         safe_log(f"Task to improve: {entry}")
         problem_statement = diagnose_problem(entry, parent_commit, root_dir, out_dir_base, patch_files=patch_files, polyglot=polyglot)
         safe_log(f"problem_statement: {problem_statement}")
@@ -321,6 +383,14 @@ def self_improve(
         cleanup_container(container)
         save_metadata(metadata, output_dir)
         return metadata
+
+    if problem_statement_suffix and problem_statement and not problem_statement_override:
+        problem_statement = (
+            problem_statement.rstrip()
+            + "\n\n"
+            + str(problem_statement_suffix).strip()
+            + "\n"
+        )
 
     metadata['entry'] = entry
     metadata['problem_statement'] = problem_statement
@@ -335,14 +405,7 @@ def self_improve(
     safe_log("Running self-improvement")
     chat_history_file_container = "/dgm/self_evo.md"
     test_description = get_test_description(swerepo=False)
-    env_vars = {
-        "ANTHROPIC_API_KEY": os.getenv('ANTHROPIC_API_KEY'),
-        "AWS_REGION": os.getenv('AWS_REGION'),
-        "AWS_REGION_NAME": os.getenv('AWS_REGION_NAME'),
-        "AWS_ACCESS_KEY_ID": os.getenv('AWS_ACCESS_KEY_ID'),
-        "AWS_SECRET_ACCESS_KEY": os.getenv('AWS_SECRET_ACCESS_KEY'),
-        "OPENAI_API_KEY": os.getenv('OPENAI_API_KEY'),
-    }
+    env_vars = llm_container_env()
     cmd = [
         "timeout", "1800",  # 30min timeout
         "python", "/dgm/coding_agent.py",
@@ -374,8 +437,36 @@ def self_improve(
                 raise Exception("Model patch file is empty")
     except Exception as e:
         safe_log(f"Failed to read model patch file: {str(e)}")
+        try:
+            cleanup_container(container)
+        except Exception as cleanup_error:
+            safe_log(f"Error cleaning up container after unreadable patch: {cleanup_error}")
         save_metadata(metadata, output_dir)
         return metadata
+
+    fixed_patch, patch_notes = prepare_model_patch(patch_content)
+    metadata.update(patch_notes)
+    if fixed_patch is None:
+        reason = patch_notes.get("model_patch_malformed_reason")
+        safe_log(f"model_patch.diff malformed ({reason}); not starting Verify")
+        metadata["model_patch_exists"] = True
+        metadata["model_patch_notempty"] = bool(patch_content.strip())
+        metadata["model_patch_rejected"] = True
+        try:
+            cleanup_container(container)
+        except Exception as cleanup_error:
+            safe_log(f"Error cleaning up container after malformed patch: {cleanup_error}")
+        save_metadata(metadata, output_dir)
+        return metadata
+    if fixed_patch != patch_content:
+        with open(model_patch_file, 'w', encoding='utf-8') as handle:
+            handle.write(fixed_patch)
+        if patch_notes.get("model_patch_salvaged"):
+            safe_log(
+                "model_patch.diff was malformed "
+                f"({patch_notes.get('model_patch_malformed_reason')}); "
+                "kept complete file diffs and skipped the truncated tail"
+            )
 
     patch_files.append(model_patch_file)
 
@@ -394,11 +485,19 @@ def self_improve(
                 run_harness_swe(entry, model_name_or_path, patch_files, num_evals, output_dir, metadata, run_id, test_more_threshold, test_task_list, test_task_list_more)
             else:
                 run_harness_polyglot(entry, model_name_or_path, patch_files, num_evals, output_dir, metadata, run_id, test_more_threshold, test_task_list, test_task_list_more)
+        except (ResourceGateError, InfraEvalError) as exc:
+            apply_infra_metadata(metadata, exc.code, str(exc))
+            safe_log(f"Verify stopped: {metadata['error']}")
         except Exception as e:
-            safe_log(f"Error while evaluating the self-improvement: {e}")
+            text = f"{type(e).__name__}: {e}"
+            code = classify_infra_error(text)
+            if code:
+                apply_infra_metadata(metadata, code, text)
+            safe_log(f"Error while evaluating the self-improvement: {redact_secrets(text)}")
 
-    # Post-self-improvement diagnosis
-    if post_improve_diagnose:
+    # Post-self-improvement diagnosis is another model call. Skip it when
+    # Verify already failed because the host cannot run.
+    if post_improve_diagnose and not metadata.get("infra_error_code"):
         safe_log("Diagnosing the self-improvement")
         metadata['is_compiled'] = is_compiled_self_improve(metadata)
         if metadata['is_compiled']:

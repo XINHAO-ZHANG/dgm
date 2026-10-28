@@ -4,13 +4,38 @@ import json
 import math
 import os
 import random
+import sys
+import traceback
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, TimeoutError
 
 from prompts.self_improvement_prompt import find_selfimprove_eval_logs
-from self_improve_step import self_improve
 from utils.common_utils import load_json_file
 from utils.docker_utils import setup_logger
 from utils.evo_utils import load_dgm_metadata, is_compiled_self_improve
+from utils.host_resources import (
+    ResourceGateError,
+    add_resource_arguments,
+    classify_infra_error,
+    cleanup_owned_workspaces,
+    sweep_abandoned_workspaces,
+    ensure_workspace_owner,
+    publish_resource_policy,
+    require_resources,
+    resource_check_report,
+    stop_reason_for_infra,
+    thresholds_from_args,
+)
+from utils.secret_redaction import redact_secrets
+
+
+def log_selfimprove_failure(logger, exc: BaseException) -> None:
+    """Write a self-improve failure to the outer log without secret values.
+
+    ``subprocess.TimeoutExpired`` and ``CalledProcessError`` include argv in
+    ``str(exc)`` and in the traceback. Redact before either line is logged.
+    """
+    logger.error("Self-improvement step failed: %s", redact_secrets(str(exc)))
+    logger.error("Traceback:\n%s", redact_secrets(traceback.format_exc()))
 
 def initialize_run(output_dir, prevrun_dir=None, polyglot=False):
     # Initialize archive
@@ -218,14 +243,17 @@ def get_full_eval_threshold(output_dir, archive):
 
     return threshold
 
-def main():
+def main(argv=None):
+    # Imported here so the failure logger can be unit-tested without the model stack.
+    from self_improve_step import self_improve
+
     parser = argparse.ArgumentParser(description="Darwin Godel Machine!")
     parser.add_argument("--max_generation", type=int, default=80, help="Maximum number of evolution iterations.")
     parser.add_argument("--selfimprove_size", type=int, default=2, help="Number of self-improvements attempts per DGM generation.")
     parser.add_argument("--selfimprove_workers", type=int, default=2, help="Number of parallel workers for self-improvement attempts.")
     parser.add_argument(
         "--choose_selfimproves_method", type=str, default='score_child_prop',
-        choices=['random', 'score_prop', 'score_child_prop' 'best'],
+        choices=['random', 'score_prop', 'score_child_prop', 'best'],
         help="Method to choose self-improve attempts.",
     )
     parser.add_argument("--continue_from", type=str, default=None, help="Directory to continue the run from.")
@@ -239,15 +267,22 @@ def main():
     parser.add_argument("--no_full_eval", default=False, action='store_true', help="Do not run full evaluation on swe if a node is the top N highest performing.")
     # baselines
     parser.add_argument("--run_baseline", type=str, default=None, choices=['no_selfimprove', 'no_darwin'], help="Baseline to run.")
-    args = parser.parse_args()
+    add_resource_arguments(parser)
+    args = parser.parse_args(argv)
+    if args.dry_resource_check:
+        report = resource_check_report(thresholds_from_args(args))
+        report["continue_on_infra_error"] = bool(args.continue_on_infra_error)
+        print(json.dumps(report, indent=2))
+        return 0 if report["ok"] else 2
 
     # Variables for this DGM run
     if not args.continue_from:
         run_id = datetime.datetime.now().strftime("%Y%m%d%H%M%S_%f")
     else:
         run_id = os.path.basename(args.continue_from)
-        
-    output_dir = os.path.join("./output_dgm", run_id)
+
+    output_root = os.environ.get("DGM_OUTPUT_ROOT", "./output_dgm")
+    output_dir = os.path.join(output_root, run_id)
     os.makedirs(output_dir, exist_ok=True)
 
     # Initialize
@@ -265,9 +300,40 @@ def main():
     logger = setup_logger(os.path.join(output_dir, "dgm_outer.log"))
     logger.info(f"Starting DGM run {run_id} with arguments: {vars(args)}")
     logger.info(f"Archive: {archive}")
+    thresholds = thresholds_from_args(args)
+    owner = ensure_workspace_owner(output_dir)
+    publish_resource_policy(thresholds)
+    logger.info(
+        "resource gate min_tmp_free_gb=%s min_available_mem_gb=%s max_mem_pressure=%s "
+        "continue_on_infra_error=%s workspace_owner=%s",
+        args.min_tmp_free_gb,
+        args.min_available_mem_gb,
+        args.max_mem_pressure,
+        bool(args.continue_on_infra_error),
+        owner,
+    )
+    leftover = sweep_abandoned_workspaces()
+    if leftover:
+        logger.info("removed %s leftover apptainer workspace(s) for this run", len(leftover))
     test_more_threshold = 0.4
     # Run the DGM
+    stop_code = None
     for gen_num in range(start_gen_num, args.max_generation):
+        try:
+            require_resources(thresholds, phase="improve")
+        except ResourceGateError as exc:
+            message = redact_secrets(str(exc))
+            logger.error("%s", message)
+            stop_code = exc.code
+            with open(os.path.join(output_dir, "dgm_metadata.jsonl"), "a") as f:
+                f.write(json.dumps({
+                    "generation": gen_num,
+                    "stop_reason": exc.code,
+                    "infra_error_code": exc.code,
+                    "error": message,
+                    "archive": archive,
+                }) + "\n")
+            break
         # Choose self-improve attempts
         selfimprove_entries = choose_selfimproves(
             output_dir, archive, args.selfimprove_size,
@@ -279,6 +345,7 @@ def main():
 
         # Run self-improvement processes
         selfimprove_ids = []
+        infra_found = []
         with ThreadPoolExecutor(max_workers=args.selfimprove_workers) as executor:
             futures = [
                 executor.submit(
@@ -304,13 +371,20 @@ def main():
                     # Added timeout to avoid hanging indefinitely (1.5 h here)
                     metadata = future.result(timeout=1.5*60*60)
                     selfimprove_ids.append(metadata['run_id'])
+                    if isinstance(metadata, dict) and metadata.get("infra_error_code"):
+                        infra_found.append(metadata)
                 except TimeoutError:
                     logger.error("Self-improvement attempt timed out.")
                     future.cancel()  # Optionally cancel the future if it's still running
                 except Exception as e:
-                    import traceback
-                    logger.error(f"Self-improvement step failed: {e}")
-                    logger.error(f"Traceback:\n{traceback.format_exc()}")
+                    log_selfimprove_failure(logger, e)
+                    code = classify_infra_error(redact_secrets(f"{type(e).__name__}: {e}"))
+                    if code:
+                        infra_found.append({"infra_error_code": code})
+
+        removed = sweep_abandoned_workspaces()
+        if removed:
+            logger.info("removed %s apptainer workspace(s) for this run", len(removed))
 
         # Update archive
         logger.info(f"Updating archive for generation {gen_num}")
@@ -322,15 +396,33 @@ def main():
         archive = update_archive(output_dir, archive, selfimprove_ids_compiled, method=args.update_archive, noise_leeway=args.eval_noise)
 
         # Save DGM state
+        record = {
+            "generation": gen_num,
+            "selfimprove_entries": selfimprove_entries,
+            "children": selfimprove_ids,
+            "children_compiled": selfimprove_ids_compiled,
+            "archive": archive,
+        }
+        reason = stop_reason_for_infra(
+            infra_found,
+            continue_on_infra=bool(args.continue_on_infra_error),
+        )
+        if reason:
+            record["stop_reason"] = reason
+            record["infra_error_code"] = reason
+            logger.error(
+                "Stopping after generation %s because of %s. "
+                "Remaining generations will not call the model.",
+                gen_num,
+                reason,
+            )
+            stop_code = reason
         with open(os.path.join(output_dir, "dgm_metadata.jsonl"), "a") as f:
-            f.write(json.dumps({
-                "generation": gen_num,
-                "selfimprove_entries": selfimprove_entries,
-                "children": selfimprove_ids,
-                "children_compiled": selfimprove_ids_compiled,
-                "archive": archive,
-            }, indent=2) + "\n")
+            f.write(json.dumps(record, indent=2) + "\n")
+        if stop_code:
+            break
+    return 2 if stop_code else 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 

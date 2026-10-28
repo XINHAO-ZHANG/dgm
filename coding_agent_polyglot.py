@@ -5,8 +5,14 @@ from logging.handlers import RotatingFileHandler
 import os
 import threading
 
-from llm_withtools import CLAUDE_MODEL, OPENAI_MODEL, chat_with_agent
-from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch
+from llm import resolve_code_model
+from llm_withtools import chat_with_agent
+from utils.secret_redaction import (
+    SecretRedactingFormatter,
+    install_secret_redaction,
+    redact_secrets,
+)
+from utils.git_utils import diff_versus_commit, reset_to_commit, ensure_trailing_newline, apply_patch
 
 # reset_to_commit(git_dname, commit)
 # apply_patch(git_dname, patch_str)
@@ -67,7 +73,7 @@ def setup_logger(log_file='./chat_history.md', level=logging.INFO):
     logger.handlers = []
     
     # Create formatters
-    file_formatter = logging.Formatter('%(message)s')
+    file_formatter = SecretRedactingFormatter('%(message)s')
     
     # Create and set up file handler
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
@@ -77,6 +83,7 @@ def setup_logger(log_file='./chat_history.md', level=logging.INFO):
     
     # Add handlers to logger
     logger.addHandler(file_handler)
+    install_secret_redaction(logger)
     
     # Store logger in thread-local storage
     set_thread_logger(logger)
@@ -86,7 +93,9 @@ def setup_logger(log_file='./chat_history.md', level=logging.INFO):
 def safe_log(message, level=logging.INFO):
     """
     Thread-safe logging function that ensures messages go to the correct logger.
+    Secret values are redacted before they are written.
     """
+    message = redact_secrets(message)
     logger = get_thread_logger()
     if logger:
         logger.log(level, message)
@@ -102,7 +111,8 @@ class AgenticSystem:
             chat_history_file='./chat_history.md',
             test_description=None,
             self_improve=False,
-            language='python'
+            language='python',
+            model=None,
         ):
         self.problem_statement = problem_statement
         self.git_tempdir = git_tempdir
@@ -112,8 +122,10 @@ class AgenticSystem:
         self.self_improve = self_improve
         self.language = language
 
-        # Set the code model based on whether self-improvement is enabled
-        self.code_model = CLAUDE_MODEL if not self_improve else OPENAI_MODEL
+        # Verify and Improve share the OpenRouter backbone unless --model
+        # or DGM_EVAL_MODEL selects another id (including a bedrock/ id).
+        self.code_model = resolve_code_model(self_improve=self_improve, explicit=model)
+        print(f"Coding agent model: {self.code_model}")
 
         # Initialize logger and store it in thread-local storage
         self.logger = setup_logger(chat_history_file)
@@ -162,6 +174,11 @@ def main():
     parser.add_argument('--test_description', default=None, required=False, help='Description of how to test the repository')
     parser.add_argument('--self_improve', default=False, action='store_true', help='Whether to self-improve the repository or solving swe')
     parser.add_argument('--language', required=False, default="python", choices=['cpp', 'java', 'python', 'go', 'rust', 'javascript'], help='Task\'s programming language')
+    parser.add_argument(
+        '--model',
+        default=None,
+        help='Coding-agent model id. Verify defaults to OpenRouter qwen/qwen3-coder-flash. Override with DGM_EVAL_MODEL.',
+    )
     args = parser.parse_args()
 
     # Process the repository
@@ -173,13 +190,14 @@ def main():
         test_description=args.test_description,
         self_improve=args.self_improve,
         language=args.language,
+        model=args.model,
     )
 
     # Run the agentic system to try to solve the problem
     agentic_system.forward()
 
     # Get code diff and save to model_patch.diff
-    model_patch = diff_versus_commit(args.git_dir, args.base_commit)
+    model_patch = ensure_trailing_newline(diff_versus_commit(args.git_dir, args.base_commit))
     model_patch_outfile = os.path.join(args.outdir, 'model_patch.diff') if args.outdir else 'model_patch.diff'
     with open(model_patch_outfile, 'w') as f:
         f.write(model_patch)
