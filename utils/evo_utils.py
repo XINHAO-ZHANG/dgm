@@ -77,9 +77,19 @@ def get_all_performance(run_keyword, results_dir='./swe_bench'):
         total_submitted_instances += submitted_instances
         accuracy_score = resolved_instances / submitted_instances if submitted_instances > 0 else 0
         performance_results.append({'file': file_name, 'accuracy_score': accuracy_score, **eval_results})
-        total_unresolved_ids.extend(eval_results.get('unresolved_ids', []))
-        total_emptypatch_ids.extend(eval_results.get('empty_patch_ids', []))
-        total_resolved_ids.extend(eval_results.get('resolved_ids', []))
+        unresolved_ids = eval_results.get('unresolved_ids', [])
+        empty_ids = eval_results.get('empty_patch_ids', [])
+        resolved_ids = eval_results.get('resolved_ids', [])
+        total_unresolved_ids.extend(unresolved_ids)
+        total_emptypatch_ids.extend(empty_ids)
+        total_resolved_ids.extend(resolved_ids)
+        # Failed task evals still cover a submitted instance. Fold them into
+        # unresolved so protocol coverage matches the screen. Leave ids that
+        # already have a resolved, unresolved, or empty classification alone
+        # so an empty patch is not reclassified.
+        total_unresolved_ids.extend(
+            _unclassified_failure_ids(eval_results, list(unresolved_ids) + list(empty_ids) + list(resolved_ids))
+        )
 
     # Calculate the overall accuracy score
     overall_performance = {}
@@ -92,6 +102,31 @@ def get_all_performance(run_keyword, results_dir='./swe_bench'):
     overall_performance['total_resolved_ids'] = total_resolved_ids
     
     return performance_results, overall_performance
+
+
+def _unclassified_failure_ids(eval_results, already_classified):
+    """Return incomplete and error task ids that have no other classification.
+
+    The harness records a task that did not finish in ``incomplete_ids``, and
+    a finished task with no resolved/unresolved/empty outcome in ``error_ids``.
+    Neither list is a missing protocol id: the task was submitted and did not
+    resolve. Ids already present in resolved, unresolved, or empty stay in
+    that list.
+    """
+
+    seen = set(already_classified)
+    extras = []
+    for key in ("incomplete_ids", "error_ids"):
+        values = eval_results.get(key) or []
+        if not isinstance(values, (list, tuple)):
+            continue
+        for item in values:
+            if item in seen:
+                continue
+            seen.add(item)
+            extras.append(item)
+    return extras
+
 
 def is_compiled_self_improve(metadata, num_swe_issues=[], logger=None):
     """
