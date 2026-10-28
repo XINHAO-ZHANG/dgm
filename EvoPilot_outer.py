@@ -1,8 +1,9 @@
 """EvoPilot outer loop.
 
 Single active agent, a small trusted checkpoint bank, and an explicit
-recovery policy. ``DGM_outer.py`` is unchanged and remains the archive
-baseline.
+recovery policy. After Verify, the default decider is the LLM Control
+Agent (``--controller llm``). ``--controller policy`` keeps the rule
+table. ``DGM_outer.py`` is unchanged and remains the archive baseline.
 
 Dry run (no API keys, no container, no Polyglot evolution)::
 
@@ -23,6 +24,7 @@ import shutil
 import sys
 import uuid
 
+from evopilot.control_agent import ControlAgent, bind_control_agent
 from evopilot.controller import RecoveryController
 from evopilot.evidence import evidence_from_dgm_metadata, with_escalation_fallback
 from evopilot.policy import VerifyPolicy
@@ -63,6 +65,21 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--catastrophic_drop", type=float, default=0.2, help="Score drop treated as a structural regression.")
     parser.add_argument("--benchmark", choices=["polyglot", "swe"], default="polyglot")
     parser.add_argument("--dry_run", action="store_true", help="Replay a synthetic trace. No model calls and no container.")
+    parser.add_argument(
+        "--controller",
+        choices=("llm", "policy"),
+        default="llm",
+        help=(
+            "Who chooses accept, debug, rollback, or checkmate after Verify. "
+            "llm (default) is the Control Agent and is not overridden by score thresholds. "
+            "policy keeps the rule-based VerifyPolicy. Dry run always replays the synthetic policy trace."
+        ),
+    )
+    parser.add_argument(
+        "--control_model",
+        default=None,
+        help="Control Agent model. Defaults to the Improve backbone (qwen/qwen3-coder-flash on OpenRouter).",
+    )
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--continue_from", type=str, default=None, help="Resume a previous EvoPilot output directory.")
     parser.add_argument("--num_evals", type=int, default=1, help="Repeated evaluations passed through to self_improve.")
@@ -286,11 +303,39 @@ def _write_summary_fields(output_dir: str, extra: dict) -> None:
         handle.write("\n")
 
 
+def install_controller_decider(controller: RecoveryController, args: argparse.Namespace) -> None:
+    """Attach the Control Agent, or leave VerifyPolicy in place for experiments."""
+
+    if getattr(args, "controller", "llm") == "policy":
+        controller.decider = None
+        controller.decision_source = "policy"
+        return
+    bind_control_agent(controller, ControlAgent(model=getattr(args, "control_model", None)))
+
+
+def note_control_workspace(controller: RecoveryController, output_dir: str, run_id: str | None) -> None:
+    """Point the evidence pack at this candidate's artifacts, when they exist."""
+
+    controller.output_dir = os.path.abspath(output_dir)
+    if not run_id or str(run_id).startswith("failed"):
+        controller.workspace_dir = None
+        return
+    folder = candidate_dir(output_dir, str(run_id))
+    controller.workspace_dir = folder if os.path.isdir(folder) else None
+
+
 def drive_escalations(controller, evidence, rerun):
-    """Turn an escalate decision into one broader sample, then a terminal decision."""
+    """Turn an escalate decision into one broader sample, then a terminal decision.
+
+    Escalate is a VerifyPolicy action. The Control Agent does not emit it,
+    and this loop does not replace an agent action with a score rule.
+    """
 
     guard = 0
     while True:
+        output_dir = getattr(controller, "output_dir", None)
+        if output_dir:
+            note_control_workspace(controller, output_dir, evidence.candidate_id)
         result = controller.step(evidence)
         if result.decision != Decision.ESCALATE:
             return result, evidence
@@ -327,6 +372,8 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
             snapshot_from_initial_metadata(os.path.join(output_dir, "initial", "metadata.json"), protocol)
         )
         flush_run(output_dir, controller, mode="live", disclaimer=LIVE_DISCLAIMER)
+    controller.output_dir = os.path.abspath(output_dir)
+    install_controller_decider(controller, args)
 
     polyglot = args.benchmark == "polyglot"
     log_path = os.path.join(output_dir, "evopilot_outer.log")
@@ -345,6 +392,10 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
     runtime = resolve_container_runtime()
     log(live_start_message(runtime, args.benchmark))
     more_size = 0 if schedule.test_task_list_more is None else len(schedule.test_task_list_more)
+    log(
+        f"controller={controller.decision_source} "
+        f"control_model={getattr(args, 'control_model', None) or 'improve-backbone'}"
+    )
     log(
         "verify schedule "
         f"screen={len(schedule.test_task_list)} "
@@ -418,8 +469,8 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
                 score_protocol=protocol,
                 lineage_id=controller.lineage_id,
             )
-            return controller.step(current)
-        return controller.step(_infra_evidence(controller, code, message, current))
+            return controller.step(current, force_policy=True)
+        return controller.step(_infra_evidence(controller, code, message, current), force_policy=True)
 
     while controller.generation < args.max_generation and stop_code is None:
         controller.maybe_escape_stagnation()
@@ -465,7 +516,7 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
             protocol_ids=protocol,
         )
         if _is_infra(metadata):
-            result = controller.step(evidence)
+            result = controller.step(evidence, force_policy=True)
             log_decision(result)
             flush_run(output_dir, controller, mode="live", disclaimer=LIVE_DISCLAIMER)
             remember_stop(str(metadata.get("infra_error_code")), str(metadata.get("error") or metadata.get("infra_error_code")))
@@ -569,7 +620,7 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
                 protocol_ids=protocol,
             )
             if _is_infra(metadata):
-                result = controller.step(evidence)
+                result = controller.step(evidence, force_policy=True)
                 log_decision(result)
                 flush_run(output_dir, controller, mode="live", disclaimer=LIVE_DISCLAIMER)
                 remember_stop(str(metadata.get("infra_error_code")), str(metadata.get("error") or metadata.get("infra_error_code")))
@@ -587,6 +638,12 @@ def run_live(args: argparse.Namespace, output_dir: str) -> dict:
             break
         if debug_interrupted:
             continue
+        if result.decision == Decision.DEBUG:
+            controller.close_bounded_debug()
+            log(
+                f"generation {controller.generation} debug bound reached; "
+                "the control decision stays debug and no score rule replaces it"
+            )
         log_decision(result)
         flush_run(output_dir, controller, mode="live", disclaimer=LIVE_DISCLAIMER)
         release_workspaces()

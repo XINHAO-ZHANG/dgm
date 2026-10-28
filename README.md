@@ -94,7 +94,9 @@ python DGM_outer.py --polyglot
 
 ## EvoPilot recovery controller
 
-EvoPilot is an alternate outer loop. It keeps one active agent, a small trusted checkpoint bank (default K=4), and a verify → bounded debug (default R=2) → accept or rollback → replan controller. It does not replace the DGM archive. `DGM_outer.py` remains the archive baseline. Both outer loops share a host resource gate so a full disk, memory pressure, or a broken Apptainer start stops the run instead of starting another generation.
+EvoPilot is an alternate outer loop. It keeps one active agent, a small trusted checkpoint bank (default K=4), and a verify → bounded debug (default R=2) → accept, rollback, or checkmate → replan controller. It does not replace the DGM archive. `DGM_outer.py` remains the archive baseline. Both outer loops share a host resource gate so a full disk, memory pressure, or a broken Apptainer start stops the run instead of starting another generation.
+
+After Verify, the default decider is an LLM Control Agent on the same backbone as Improve (`qwen/qwen3-coder-flash` via OpenRouter). It reads one evidence pack and returns `accept`, `debug`, `rollback`, or `checkmate`. The outer loop executes that action and does not replace it with a score threshold. `--controller policy` restores the rule-based `VerifyPolicy`. `--control_model` overrides the agent model. `--dry_run` stays on the synthetic policy trace and does not call a model. The pack is built from the candidate directory: whether `model_patch.diff` is empty and which files it changes; Improve/Debug logs (`self_evo.md`, and `self_improve.log` when that is where the tool trace landed) for tool-parse failures and view calls versus writes; Verify score, resolved / unresolved / empty-patch ids, compile and structure errors, and whether the protocol is comparable; the checkpoint bank and the active agent; and this lineage's debug count plus recent failure intents.
 
 The controller records a compute curve for later AUEC-style analysis: cumulative evaluations, best accepted score, and the score of the agent currently being evolved. Token totals are stored only when a self-improve result actually reports them. A dry run does not invent either benchmark scores or paper metrics.
 
@@ -103,7 +105,7 @@ Smoke path, no API keys and no container:
 ```bash
 python3 EvoPilot_outer.py --dry_run --output_dir /tmp/evopilot_smoke
 python3 EvoPilot_outer.py --dry-resource-check
-python3 -m pytest tests/test_evopilot_controller.py tests/test_apptainer_compat.py tests/test_host_resources.py
+python3 -m pytest tests/test_evopilot_controller.py tests/test_control_agent.py tests/test_apptainer_compat.py tests/test_host_resources.py
 ```
 
 The smoke command replays a fixed synthetic trace and writes:
@@ -146,7 +148,7 @@ What is still scaffolding, not a paper run: there is no neutralized-initializati
 - `coding_agent.py` main implementation of the initial coding agent
 - `DGM_outer.py` entry point for running the DGM algorithm
 - `EvoPilot_outer.py` entry point for the EvoPilot recovery controller
-- `evopilot/` controller state, verify policy, checkpoint bank, evolution memory, and AUEC ledger
+- `evopilot/` controller state, Control Agent, verify-policy fallback, checkpoint bank, evolution memory, and AUEC ledger
 
 ## Logs from Experiments
 This [google drive folder](https://drive.google.com/drive/folders/1Kcu9TbIa9Z50pJ7S6hH9omzzD1pxIYZC?usp=sharing) contains all the foundation model output logs from the experiments shown in the paper.

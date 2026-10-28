@@ -21,6 +21,11 @@ RETIRE_AFTER = 2
 REINFORCE_STEP = 0.1
 CONFIDENCE_CAP = 0.95
 UNTRIED_INTENT_LIMIT = 3
+# Outcomes that leave a soft constraint and a failed intent. ``debug_bounded``
+# is the execution cap on Debug, not a score override.
+CONSTRAINT_OUTCOMES = frozenset({"rolled_back", "checkmate", "debug_bounded"})
+# Rollbacks and checkmates count toward a checkpoint's dead-end score.
+DEAD_END_OUTCOMES = frozenset({"rolled_back", "checkmate"})
 
 
 def normalize_intent(intent: str) -> str:
@@ -101,13 +106,14 @@ class EvolutionMemory:
         entry.failure_cluster = failure_cluster or entry.failure_cluster
         entry.rollback_target = rollback_target
         entry.rollback_reason = rollback_reason
-        if outcome == "rolled_back":
+        if outcome in CONSTRAINT_OUTCOMES:
             entry.confidence = INITIAL_ROLLBACK_CONFIDENCE
             entry.future_constraint = (
                 f"Avoid repeating intent '{entry.change_intent}' from checkpoint "
                 f"{entry.checkpoint_id} when failure cluster is {entry.failure_cluster}."
             )
-            self._reinforce(entry.checkpoint_id, entry.failure_cluster, skip=entry)
+            if outcome in DEAD_END_OUTCOMES:
+                self._reinforce(entry.checkpoint_id, entry.failure_cluster, skip=entry)
         else:
             entry.confidence = 1.0
             entry.future_constraint = None
@@ -118,7 +124,7 @@ class EvolutionMemory:
         return sum(
             1
             for entry in self.entries
-            if entry.outcome == "rolled_back"
+            if entry.outcome in DEAD_END_OUTCOMES
             and not entry.retired
             and entry.checkpoint_id == checkpoint_id
             and entry.failure_cluster == failure_cluster
@@ -138,7 +144,7 @@ class EvolutionMemory:
         steps = [
             entry.step
             for entry in self.entries
-            if entry.outcome == "rolled_back" and entry.failure_cluster == failure_cluster
+            if entry.outcome in DEAD_END_OUTCOMES and entry.failure_cluster == failure_cluster
         ]
         onset = min(steps) if steps else current_step
         return checkpoint_step < onset
@@ -148,7 +154,7 @@ class EvolutionMemory:
         if not key:
             return
         for entry in self.entries:
-            if entry.outcome != "rolled_back" or entry.retired or not entry.future_constraint:
+            if entry.outcome not in CONSTRAINT_OUTCOMES or entry.retired or not entry.future_constraint:
                 continue
             if normalize_intent(entry.change_intent) != key:
                 continue
@@ -160,7 +166,7 @@ class EvolutionMemory:
     def active_constraints(self) -> list[str]:
         texts = []
         for entry in self.entries:
-            if entry.retired or entry.outcome != "rolled_back" or not entry.future_constraint:
+            if entry.retired or entry.outcome not in CONSTRAINT_OUTCOMES or not entry.future_constraint:
                 continue
             if entry.confidence < CONFIDENCE_FLOOR:
                 continue
@@ -170,7 +176,7 @@ class EvolutionMemory:
     def recent_failed_intents(self, limit: int = 5) -> list[str]:
         found: list[str] = []
         for entry in reversed(self.entries):
-            if entry.outcome != "rolled_back" or entry.retired:
+            if entry.outcome not in CONSTRAINT_OUTCOMES or entry.retired:
                 continue
             intent = entry.change_intent.strip()
             if intent and intent not in found:
@@ -182,7 +188,7 @@ class EvolutionMemory:
     def blocked_targets(self, min_confidence: float = 0.5) -> set[str]:
         blocked = set()
         for entry in self.entries:
-            if entry.outcome != "rolled_back" or entry.retired:
+            if entry.outcome not in DEAD_END_OUTCOMES or entry.retired:
                 continue
             if entry.confidence < min_confidence:
                 continue
@@ -199,7 +205,7 @@ class EvolutionMemory:
 
     def _reinforce(self, checkpoint_id: str, failure_cluster: str, skip: MemoryEntry) -> None:
         for entry in self.entries:
-            if entry is skip or entry.retired or entry.outcome != "rolled_back":
+            if entry is skip or entry.retired or entry.outcome not in DEAD_END_OUTCOMES:
                 continue
             if entry.checkpoint_id != checkpoint_id or entry.failure_cluster != failure_cluster:
                 continue

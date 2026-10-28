@@ -3,7 +3,10 @@
 S_t = (H_t, C_t, M_t, E_t): the active agent, a small trusted checkpoint
 bank, control-oriented evolution memory, and the current verification
 evidence. Actions are improve, verify, debug, accept, escalate, rollback,
-and replan. Improve itself stays in the existing self-improve step.
+checkmate, and replan. Checkmate ends the current lineage and switches
+checkpoint the way stagnation escalation already does. Improve itself stays
+in the existing self-improve step. The default live decider is the Control
+Agent; ``VerifyPolicy`` remains the fallback.
 """
 
 from __future__ import annotations
@@ -17,6 +20,16 @@ class Decision(str, Enum):
     ESCALATE = "escalate"
     DEBUG = "debug"
     ROLLBACK = "rollback"
+    CHECKMATE = "checkmate"
+
+
+@dataclass(frozen=True)
+class ControlDecision:
+    """Structured Control Agent output. The outer loop executes ``action``."""
+
+    action: Decision
+    reason: str
+    next_constraints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -195,3 +208,4 @@ class ControlResult:
     lineage_id: str
     replan: ReplanContext
     stagnation: StagnationSignal
+    next_constraints: tuple[str, ...] = ()
