@@ -98,8 +98,9 @@ def test_incomplete_ids_keep_the_screen_comparable(tmp_path):
     0.1 score is comparable with the 0.2 baseline and is not discarded.
     """
 
-    unresolved = [item for item in SMALL if item not in BASELINE_RESOLVED and item != INCOMPLETE]
     resolved = [BASELINE_RESOLVED[0]]
+    unresolved = [item for item in SMALL if item not in resolved and item != INCOMPLETE]
+    assert len(resolved) + len(unresolved) == 9
     overall = _overall_from_report(
         tmp_path,
         _screen_report(resolved=resolved, unresolved=unresolved, incomplete=[INCOMPLETE]),
@@ -123,11 +124,12 @@ def test_incomplete_ids_keep_the_screen_comparable(tmp_path):
 
 
 def test_id_missing_from_every_outcome_list_stays_incomparable(tmp_path):
-    unresolved = [item for item in SMALL if item not in BASELINE_RESOLVED and item != INCOMPLETE]
+    resolved = [BASELINE_RESOLVED[0]]
+    unresolved = [item for item in SMALL if item not in resolved and item != INCOMPLETE]
     overall = _overall_from_report(
         tmp_path,
         _screen_report(
-            resolved=list(BASELINE_RESOLVED[:1]),
+            resolved=resolved,
             unresolved=unresolved,
             resolved_instances=9,
         ),
@@ -151,11 +153,12 @@ def test_id_missing_from_every_outcome_list_stays_incomparable(tmp_path):
 
 
 def test_error_ids_count_as_unresolved_coverage(tmp_path):
-    unresolved = [item for item in SMALL if item not in BASELINE_RESOLVED and item != INCOMPLETE]
+    resolved = [BASELINE_RESOLVED[0]]
+    unresolved = [item for item in SMALL if item not in resolved and item != INCOMPLETE]
     overall = _overall_from_report(
         tmp_path,
         _screen_report(
-            resolved=[BASELINE_RESOLVED[0]],
+            resolved=resolved,
             unresolved=unresolved,
             error=[INCOMPLETE],
         ),
