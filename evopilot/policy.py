@@ -1,4 +1,8 @@
-"""Verification-conditioned decision between accept, escalate, debug, and rollback.
+"""Rule-based fallback for accept, escalate, debug, and rollback.
+
+The live EvoPilot loop uses the Control Agent instead. Pass
+``--controller policy`` to keep this table. The agent path does not call
+``decide``.
 
 The order is deliberate:
 

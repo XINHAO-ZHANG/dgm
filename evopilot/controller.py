@@ -3,7 +3,14 @@
 The outer loop calls ``begin_attempt`` for an improve, then ``step`` once
 per verification. Debug and escalate leave the attempt open. Accept commits
 the candidate into the checkpoint bank. Rollback selects a bank member and
-the next improve is replanned from that agent.
+the next improve is replanned from that agent. Checkmate ends the lineage
+and switches to an earlier checkpoint, the same hop stagnation escalation
+uses.
+
+``decider`` replaces ``VerifyPolicy`` for that one choice. The policy
+remains the fallback when no decider is installed, and for host failures
+passed with ``force_policy``. A decider's action is not rewritten from
+the candidate score.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ from evopilot.stagnation import detect_stagnation
 from evopilot.types import (
     AgentSnapshot,
     AttemptOutcome,
+    ControlDecision,
     ControlResult,
     Decision,
     ReplanContext,
@@ -66,6 +74,12 @@ class RecoveryController:
         self._stagnation_latched = False
         self._accepted_last = False
         self._replan_reason = "steady"
+        self.decider = None
+        self.decision_source = "policy"
+        self.workspace_dir: str | None = None
+        self.output_dir: str | None = None
+        self._agent_constraints: list[str] = []
+        self._broaden_once = False
 
     def bootstrap(self, initial: AgentSnapshot) -> None:
         initial = replace(initial, root=True, step=0)
@@ -94,6 +108,9 @@ class RecoveryController:
     def begin_attempt(self, change_intent: str, targeted_failure_mode: str = "") -> str:
         if self.active is None:
             raise RuntimeError("bootstrap the controller before an improve attempt")
+        # The previous checkmate asked for one broader improve. The caller
+        # reads replan_context before begin_attempt, so this consumes it.
+        self._broaden_once = False
         open_entry = self.memory.open_entry
         if open_entry is not None and open_entry.outcome == "open":
             self.memory.begin(
@@ -118,7 +135,7 @@ class RecoveryController:
         )
         return self.lineage_id
 
-    def step(self, evidence: VerificationEvidence) -> ControlResult:
+    def step(self, evidence: VerificationEvidence, *, force_policy: bool = False) -> ControlResult:
         if self.active is None:
             raise RuntimeError("bootstrap the controller before verification")
         origin = self.active
@@ -126,11 +143,25 @@ class RecoveryController:
         if self.memory.open_entry is None:
             self.begin_attempt(evidence.change_intent, evidence.targeted_failure_mode)
 
-        decision, reason = self.policy.decide(evidence)
+        constraints: tuple[str, ...] = ()
+        use_agent = self.decider is not None and not force_policy
+        if use_agent:
+            chosen = self.decider(evidence)
+            if not isinstance(chosen, ControlDecision):
+                raise RuntimeError("control decider must return ControlDecision")
+            decision = chosen.action
+            reason = chosen.reason
+            constraints = chosen.next_constraints
+            if decision not in {Decision.ACCEPT, Decision.DEBUG, Decision.ROLLBACK, Decision.CHECKMATE}:
+                raise RuntimeError(f"control decider returned {decision}; score rules will not replace it")
+        else:
+            decision, reason = self.policy.decide(evidence)
+        decision_source = "llm" if use_agent else "policy"
         self.memory.record_verification(self._verification_payload(evidence, decision, reason))
 
         rollback_target = None
         rollback_mode = None
+        bank_reason = None
         if decision == Decision.ACCEPT:
             self._accept(evidence, origin)
             self._last_rollback_mode = None
@@ -150,31 +181,32 @@ class RecoveryController:
             )
             self._replan_reason = reason
         elif decision == Decision.ROLLBACK:
-            choice = self.bank.select(
-                active=origin,
-                cluster=evidence.failure_cluster,
-                memory=self.memory,
-                current_step=self.generation,
+            rollback_target, rollback_mode, bank_reason = self._commit_bank_move(
+                origin,
+                evidence,
+                reason,
                 force_deeper=False,
+                memory_outcome="rolled_back",
+                attempt_decision="rollback",
             )
-            rollback_target = choice.target
-            rollback_mode = choice.mode
-            self._apply_rollback(origin, choice, evidence.failure_cluster)
-            closed = self.memory.close(
-                outcome="rolled_back",
-                reason=reason,
-                failure_cluster=evidence.failure_cluster,
-                rollback_target=choice.target.agent_id,
-                rollback_reason=choice.reason,
+        elif decision == Decision.CHECKMATE:
+            rollback_target, rollback_mode, bank_reason = self._commit_bank_move(
+                origin,
+                evidence,
+                reason,
+                force_deeper=True,
+                memory_outcome="checkmate",
+                attempt_decision="checkmate",
             )
-            self._record_outcome(closed.change_intent, evidence.failure_cluster, "rollback")
-            self._last_rollback_mode = choice.mode
-            self._accepted_last = False
-            self._replan_reason = choice.reason
+            self._stagnation_latched = True
+            self._broaden_once = True
+            self._replan_reason = reason
         elif decision == Decision.ESCALATE:
             self._replan_reason = reason
         else:
             raise RuntimeError(f"unexpected decision {decision}")
+
+        self._remember_constraints(constraints, replace=decision == Decision.ACCEPT)
 
         if decision == Decision.ACCEPT:
             closed = self.memory.close(
@@ -192,7 +224,7 @@ class RecoveryController:
             min_steps=self.stagnation_min_steps,
         )
         next_debug = evidence.debug_round + 1 if decision == Decision.DEBUG else evidence.debug_round
-        if decision in {Decision.ACCEPT, Decision.ROLLBACK}:
+        if decision in {Decision.ACCEPT, Decision.ROLLBACK, Decision.CHECKMATE}:
             next_debug = 0
 
         assert self.active is not None
@@ -206,11 +238,13 @@ class RecoveryController:
             "resolved_target": evidence.resolved_target,
             "debug_round": evidence.debug_round,
             "debug_stalled": evidence.debug_stalled,
+            "decision_source": decision_source,
+            "next_constraints": list(constraints),
         }
         if rollback_target is not None:
             details["rollback_target"] = rollback_target.agent_id
             details["rollback_mode"] = rollback_mode
-            details["rollback_reason"] = self._replan_reason
+            details["rollback_reason"] = bank_reason
         self.ledger.record(
             event=decision.value,
             step=self.generation,
@@ -223,7 +257,14 @@ class RecoveryController:
             tokens=evidence.tokens,
             details=details,
         )
-        return self._result(decision, reason, rollback_target, rollback_mode, next_debug)
+        return self._result(
+            decision,
+            reason,
+            rollback_target,
+            rollback_mode,
+            next_debug,
+            constraints,
+        )
 
     def maybe_escape_stagnation(self) -> ControlResult | None:
         """On a newly detected plateau, roll back once to an earlier checkpoint.
@@ -301,15 +342,35 @@ class RecoveryController:
         )
         return self._result(Decision.ROLLBACK, self._replan_reason, self.active, mode, 0)
 
+    def close_bounded_debug(self) -> None:
+        """End an open lineage when Debug was requested and the bound is spent.
+
+        The recorded decision stays debug. The bank is left as it is and the
+        candidate score is not consulted.
+        """
+
+        entry = self.memory.open_entry
+        if entry is None or entry.outcome != "open":
+            return
+        cluster = self._last_evidence.failure_cluster if self._last_evidence else ""
+        intent = entry.change_intent
+        self.memory.close(
+            outcome="debug_bounded",
+            reason="debug_execution_bound",
+            failure_cluster=cluster,
+        )
+        self._record_outcome(intent, cluster, "debug")
+
     def replan_context(self) -> ReplanContext:
         if self.active is None:
             raise RuntimeError("bootstrap the controller before replanning")
-        broaden = self._stagnation_latched or self.last_stagnation.stagnant
+        broaden = self._broaden_once or self._stagnation_latched or self.last_stagnation.stagnant
         return build_replan_context(
             active_id=self.active.agent_id,
             memory=self.memory,
             broaden=broaden,
             reason=self._replan_reason,
+            extra_constraints=tuple(self._agent_constraints),
         )
 
     def suggest_entry(self) -> str | None:
@@ -337,6 +398,7 @@ class RecoveryController:
             "salvage_rate": salvage_rate,
             "salvage_accepted_after_debug": salvaged,
             "salvage_failed_first_verify": failed,
+            "decision_source": "llm" if self.decider is not None else "policy",
             **auec,
         }
 
@@ -388,6 +450,9 @@ class RecoveryController:
             "replan_reason": self._replan_reason,
             "debug_count": self._debug_count,
             "best_before": self._best_before,
+            "decision_source": self.decision_source,
+            "agent_constraints": list(self._agent_constraints),
+            "broaden_once": self._broaden_once,
         }
 
     @classmethod
@@ -414,6 +479,9 @@ class RecoveryController:
         controller._stagnation_latched = bool(data.get("stagnation_latched", False))
         controller._accepted_last = bool(data.get("accepted_last", False))
         controller._replan_reason = data.get("replan_reason") or "steady"
+        controller.decision_source = data.get("decision_source") or "policy"
+        controller._agent_constraints = [str(item) for item in data.get("agent_constraints") or [] if str(item).strip()]
+        controller._broaden_once = bool(data.get("broaden_once", False))
         controller._debug_count = int(data.get("debug_count") or 0)
         controller._best_before = float(data.get("best_before") or controller.best_score)
         controller.last_stagnation = detect_stagnation(
@@ -455,6 +523,48 @@ class RecoveryController:
             stalled = (not improved) and same_cluster
             evidence = replace(evidence, debug_stalled=evidence.debug_stalled or stalled)
         return evidence
+
+    def _commit_bank_move(
+        self,
+        origin: AgentSnapshot,
+        evidence: VerificationEvidence,
+        reason: str,
+        *,
+        force_deeper: bool,
+        memory_outcome: str,
+        attempt_decision: str,
+    ):
+        choice = self.bank.select(
+            active=origin,
+            cluster=evidence.failure_cluster,
+            memory=self.memory,
+            current_step=self.generation,
+            force_deeper=force_deeper,
+        )
+        self._apply_rollback(origin, choice, evidence.failure_cluster)
+        closed = self.memory.close(
+            outcome=memory_outcome,
+            reason=reason,
+            failure_cluster=evidence.failure_cluster,
+            rollback_target=choice.target.agent_id,
+            rollback_reason=choice.reason,
+        )
+        self._record_outcome(closed.change_intent, evidence.failure_cluster, attempt_decision)
+        self._last_rollback_mode = choice.mode
+        self._accepted_last = False
+        if not force_deeper:
+            self._replan_reason = choice.reason
+        return choice.target, choice.mode, choice.reason
+
+    def _remember_constraints(self, constraints: tuple[str, ...], *, replace: bool) -> None:
+        if replace:
+            self._agent_constraints = []
+        for item in constraints:
+            text = " ".join(str(item).split())
+            if text and text not in self._agent_constraints:
+                self._agent_constraints.append(text)
+        if len(self._agent_constraints) > 8:
+            self._agent_constraints = self._agent_constraints[-8:]
 
     def _accept(self, evidence: VerificationEvidence, origin: AgentSnapshot) -> None:
         if evidence.candidate_score is None:
@@ -526,6 +636,7 @@ class RecoveryController:
         rollback_target: AgentSnapshot | None,
         rollback_mode: str | None,
         debug_round: int,
+        next_constraints: tuple[str, ...] = (),
     ) -> ControlResult:
         assert self.active is not None
         return ControlResult(
@@ -538,4 +649,5 @@ class RecoveryController:
             lineage_id=self.lineage_id,
             replan=self.replan_context(),
             stagnation=self.last_stagnation,
+            next_constraints=next_constraints,
         )

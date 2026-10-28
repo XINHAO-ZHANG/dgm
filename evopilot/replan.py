@@ -19,11 +19,16 @@ def build_replan_context(
     memory: EvolutionMemory,
     broaden: bool,
     reason: str,
+    extra_constraints: tuple[str, ...] = (),
 ) -> ReplanContext:
+    soft = list(memory.active_constraints())
+    for item in extra_constraints:
+        if item and item not in soft:
+            soft.append(item)
     return ReplanContext(
         parent_id=active_id,
         excluded_intents=tuple(memory.recent_failed_intents()),
-        soft_constraints=tuple(memory.active_constraints()),
+        soft_constraints=tuple(soft),
         broaden_scope=broaden,
         increase_verification=broaden,
         reason=reason,
