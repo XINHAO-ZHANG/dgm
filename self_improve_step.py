@@ -32,6 +32,8 @@ from utils.secret_redaction import redact_secrets
 
 dataset = None
 diagnose_model = 'qwen/qwen3-coder-flash'
+# The workdir inside stays /dgm; only the cached image name differs from EvoPilot's "dgm".
+SELF_IMPROVE_IMAGE = "dgm-baseline"
 # Imported on first Polyglot Verify so a resource-gate unit test does not
 # need the SWE-bench package. Tests may replace this with a fake harness.
 polyglot_harness = None
@@ -303,8 +305,11 @@ def self_improve(
         dataset = load_dataset("princeton-nlp/SWE-bench_Verified")
         dataset = dataset['test']
 
-    # Create and start the Docker container
-    image_name = "dgm"
+    # Create and start the Docker container. EvoPilot builds its self-improve image
+    # from its own checkout under the tag "dgm", and images are cached by tag in a
+    # shared directory, so this checkout uses another tag: otherwise one method's
+    # self-edits would run in the other's image.
+    image_name = SELF_IMPROVE_IMAGE
     container_name = f"dgm-container-{run_id}"
     container = None
     try:

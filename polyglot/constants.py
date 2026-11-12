@@ -48,6 +48,12 @@ CPP_TEST_COMMANDS = [
     "cd ../"
 ]
 
+# Exercism marks all but the first Java test @Disabled. The other languages' commands
+# enable every test, so without this a Java problem could pass on one test.
+JAVA_TEST_COMMANDS = [
+    "find . -name '*Test.java' -exec sed -i '/@Disabled/d' {} +",
+    "./gradlew test",
+]
 
 TEST_COMMANDS = {
     "python": ["pytest -rA --tb=long"],
@@ -55,7 +61,7 @@ TEST_COMMANDS = {
     "go": ["go test ./..."],
     "javascript": NPM_TEST_COMMANDS,
     "cpp": CPP_TEST_COMMANDS, 
-    "java": ["./gradlew test"],
+    "java": JAVA_TEST_COMMANDS,
 }
 
 PYTHON_SPECS = {
@@ -95,7 +101,7 @@ GENERIC_SPECS = {
     },
     "java": {
         "python": "3.11",
-        "test_cmd": " ".join(TEST_COMMANDS["java"])
+        "test_cmd": "\n".join(TEST_COMMANDS["java"])
     }
 }
 

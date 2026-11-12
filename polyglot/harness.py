@@ -19,9 +19,19 @@ from utils.git_utils import (
     preflight_model_patches,
     remove_patch_by_files,
 )
-from utils.docker_utils import docker_from_env
+from utils.docker_utils import (
+    copy_from_container,
+    copy_to_container,
+    docker_from_env,
+    log_container_output,
+    remove_existing_container,
+    safe_log,
+    setup_logger,
+)
 from utils.host_resources import (
+    ResourceGateError,
     classify_infra_error,
+    finished_result,
     raise_for_infra_results,
     require_resources_from_env,
     verify_worker_block,
@@ -29,14 +39,34 @@ from utils.host_resources import (
 from utils.secret_redaction import redact_secrets
 from llm import llm_container_env, resolve_code_model
 
-from swe_bench.utils import (
-    copy_to_container,
-    copy_from_container,
-    log_container_output,
-    remove_existing_container,
-    safe_log,
-    setup_logger,
-)
+COMMAND_NOT_FOUND = 127
+
+
+def restore_stashed_solution(container):
+    """Bring the agent's solution edits back after the tests are checked out.
+
+    An agent that changed none of the solution files leaves nothing stashed, and
+    popping would then fail. That is the agent's failure, not a broken eval: the
+    tests should still run against the untouched stubs and report it.
+    """
+    listed = container.exec_run("git -C /testbed stash list", workdir='/')
+    if not listed.output.strip():
+        safe_log("No solution edits were stashed; testing the unmodified solution files.")
+        return
+    log_container_output(container.exec_run("git -C /testbed stash pop", workdir='/'))
+
+
+def eval_outcome(exit_code):
+    """Grade a test script's exit status.
+
+    The test command is fixed, so "command not found" means the image lacks the
+    toolchain. Calling that unresolved would blame the agent for every problem in
+    the language; raising leaves the result to be run again.
+    """
+    if exit_code == COMMAND_NOT_FOUND:
+        raise RuntimeError("Test command not found in the image: the language toolchain is missing.")
+    return 'resolved' if exit_code == 0 else 'unresolved'
+
 
 def get_eval_script(commands):
     return "\n".join(["#!/bin/bash", "set -uxo pipefail"] + commands) + "\n"
@@ -55,10 +85,9 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths):
     eval_result_file = out_dname / f"{instance_id}_eval.md"
 
     # Skip if output result already exists
-    if out_fname.exists():
+    result = finished_result(out_fname)
+    if result is not None:
         print(f"Skipping existing entry {instance_id}")
-        with open(out_fname) as f:
-            result = json.loads(f.read())
         return result
 
     blocked = verify_worker_block(instance_id)
@@ -178,9 +207,8 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths):
         log_container_output(exec_result)
         exec_result = container.exec_run(f"git -C /testbed clean -fd", workdir='/')
         log_container_output(exec_result)
-        exec_result = container.exec_run("git -C /testbed stash pop", workdir='/')
-        log_container_output(exec_result)
-        
+        restore_stashed_solution(container)
+
         safe_log("Running the eval")
         language = entry['language']
         test_command = TEST_COMMANDS[language]
@@ -196,10 +224,7 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths):
         exec_result = container.exec_run("timeout 120 ./eval.sh", workdir='/testbed')
         log_container_output(exec_result, raise_error=False)
         eval_result_file.write_text(exec_result.output.decode())
-        if exec_result.exit_code == 0:
-            eval_result = 'resolved'
-        else:
-            eval_result = 'unresolved'
+        eval_result = eval_outcome(exec_result.exit_code)
         
         # Write result to file
         result = {
@@ -227,7 +252,8 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths):
             proposed_model_patches = ''
 
         error_text = redact_secrets(f"{type(e).__name__}: {e}")
-        infra_code = classify_infra_error(error_text)
+        # An unpack that waited too long for room raises the gate's own code.
+        infra_code = e.code if isinstance(e, ResourceGateError) else classify_infra_error(error_text)
         # Write result to file
         result = {
             "instance_id": instance_id,
@@ -417,18 +443,14 @@ def main():
     parser.add_argument("--max_workers", type=int, default=5, help="Maximum number of concurrent threads")
     parser.add_argument("--model_name_or_path", type=str, default=None, help="Model name or path")
     parser.add_argument("--model_patch_paths", type=str, default=None, help="Paths to the model patches")
-    parser.add_argument("--num_evals", type=int, default=1, help="Repeated number of swe evaluations")
+    parser.add_argument("--num_evals", type=int, default=1, help="Repeated number of Polyglot evaluations")
     parser.add_argument("--num_evals_parallel", type=int, default=1, help="Number of parallel repeated evaluations")
     args = parser.parse_args()
     
     with open("polyglot/polyglot_benchmark_metadata.json") as f:
         metadata = json.loads(f.read())
-        language_task_list = [entry["instance_id"] for entry in metadata if entry["instance_id"].startswith("python")]
-        # Create a list of all tasks from metadata
         all_task_list = [entry["instance_id"] for entry in metadata]
-        
-    from utils.common_utils import load_json_file
-    swe_issues_med = load_json_file("./polyglot/subsets/medium.json")
+
     model_patch_paths = args.model_patch_paths.split(',') if args.model_patch_paths is not None else None
     # Run the parallel harness
 

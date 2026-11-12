@@ -276,9 +276,12 @@ def copy_from_container(container, source_path: Union[str, Path], dest_path: Uni
         safe_log(f"Error copying from container: {e}", logging.ERROR)
         raise
 
-def log_container_output(exec_result):
+def log_container_output(exec_result, raise_error=True):
     """
     Log output from a Docker container execution, handling both streaming and non-streaming cases.
+
+    ``raise_error=False`` records a non-zero exit without aborting the caller.
+    The Polyglot harness uses that when a cleanup command is allowed to fail.
     """
     # Handle output logging
     if isinstance(exec_result.output, bytes):
@@ -291,7 +294,7 @@ def log_container_output(exec_result):
                 safe_log(f"Container output: {chunk.decode().strip()}")
     
     # Check exit code
-    if exec_result.exit_code and exec_result.exit_code != 0:
+    if raise_error and exec_result.exit_code and exec_result.exit_code != 0:
         error_msg = f"Script failed with exit code {exec_result.exit_code}"
         safe_log(error_msg, logging.ERROR)
         raise Exception(error_msg)

@@ -59,12 +59,88 @@ def _short_exc(exc, limit=300):
     return text
 
 
+def _is_tool_call(value):
+    return (
+        isinstance(value, dict)
+        and "tool_name" in value
+        and isinstance(value.get("tool_input"), dict)
+    )
+
+
+def _lenient_tool_payload(body):
+    """Recover a tool call from slips whose meaning is not in doubt.
+
+    Models without built-in tool calling often write raw newlines inside a
+    JSON string, drop the last closing brace, or add a stray one. Each of
+    these has one reading. A string that never closes, or one with unescaped
+    quotes inside it, is not guessed at: it returns None and the model is
+    asked to resend, so truncated or ambiguous file contents are never written.
+    """
+    decoder = json.JSONDecoder(strict=False)
+    for closers in ("", "}", "}}", "}}}"):
+        for decode in (decoder.decode, ast.literal_eval):
+            try:
+                value = decode(body + closers)
+            except Exception:
+                continue
+            if _is_tool_call(value):
+                return value
+
+    try:
+        value, end = decoder.raw_decode(body)
+    except ValueError:
+        pass
+    else:
+        if _is_tool_call(value) and not body[end:].strip("}` \t\r\n"):
+            return value
+
+    trimmed = body
+    for _ in range(3):
+        trimmed = trimmed.rstrip()
+        if not trimmed.endswith("}"):
+            break
+        trimmed = trimmed[:-1]
+        try:
+            value = ast.literal_eval(trimmed)
+        except Exception:
+            continue
+        if _is_tool_call(value):
+            return value
+    return None
+
+
+def _manual_tool_block(response):
+    """Return the body of the first ``<tool_use>`` block, or None.
+
+    The closing tag is often misspelled (``</tool_use}``) or missing, and the
+    body is often wrapped in a code fence. Treating those as "no tool" ends
+    the agent's turn with nothing written. Text after an unclosed tag counts
+    as a block only when it opens like a tool call, so prose that merely
+    mentions the tag still is not one.
+    """
+    start = response.find("<tool_use>")
+    if start < 0:
+        return None
+    rest = response[start + len("<tool_use>"):]
+    close = re.search(r"</tool_use\s*[>}\]]?", rest)
+    body = (rest[:close.start()] if close else rest).strip()
+    fenced = re.fullmatch(r"```[a-zA-Z]*\s*(.*?)\s*(?:```)?", body, re.DOTALL)
+    if fenced:
+        body = fenced.group(1)
+    if close is None:
+        body = re.sub(r"\s*```\s*$", "", body)
+        if not body.startswith("{"):
+            return None
+    return body
+
+
 def _parse_manual_tool_payload(body):
     """Parse a manual ``<tool_use>`` body into a tool-call dict.
 
     A successful ``ast.literal_eval`` is returned as-is. ``json.loads`` runs
     only when ``literal_eval`` cannot parse the body, which covers JSON
-    ``true`` / ``false`` / ``null``.
+    ``true`` / ``false`` / ``null``. A body neither accepts goes through
+    ``_lenient_tool_payload`` before it is sent back to the model.
     """
     candidates = []
     problems = []
@@ -84,6 +160,10 @@ def _parse_manual_tool_payload(body):
             f"{name}: expected a dict with 'tool_name' and 'tool_input', "
             f"got {type(value).__name__}"
         )
+
+    recovered = _lenient_tool_payload(body)
+    if recovered is not None:
+        return recovered
 
     preview = body[:120].replace("\n", "\\n")
     if len(body) > 120:
@@ -196,10 +276,9 @@ def check_for_tool_use(response, model=''):
 
     else:
         # Any other LLM, response is str, check for <tool_use> tag in response
-        pattern = r'<tool_use>(.*?)</tool_use>'
-        match = re.search(pattern, response, re.DOTALL)
-        if match:
-            return _parse_manual_tool_payload(match.group(1).strip())
+        body = _manual_tool_block(response)
+        if body is not None:
+            return _parse_manual_tool_payload(body)
 
     # No tool use found
     return None

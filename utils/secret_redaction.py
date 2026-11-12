@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
+import traceback
 
 _REDACTED = "[REDACTED]"
 
@@ -80,6 +81,17 @@ def _redact_log_value(value: object) -> object:
     if isinstance(value, BaseException):
         return redact_secrets(value)
     return value
+
+
+def log_selfimprove_failure(logger: logging.Logger, exc: BaseException) -> None:
+    """Write a self-improve failure without secret values.
+
+    ``subprocess.TimeoutExpired`` and ``CalledProcessError`` include argv in
+    ``str(exc)`` and in the traceback. Redact before either line is logged.
+    """
+
+    logger.error("Self-improvement step failed: %s", redact_secrets(str(exc)))
+    logger.error("Traceback:\n%s", redact_secrets(traceback.format_exc()))
 
 
 def _redact_log_args(args: object) -> object:

@@ -1,0 +1,39 @@
+{
+  "source": "EvoPilot",
+  "source_commit": "282e024f233d9c0758e1b8ecd97ea24178950217",
+  "synced_at": "2026-11-12T01:59:03",
+  "files": {
+    "coding_agent_polyglot.py": "84971614b156701124c2ef3c8b9f44182df42c47cc1c6acc0a144c4488eccc1e",
+    "llm.py": "15b19272fae59f1dc4f4efa960a2156d235dc77768f6d8ccea58d34405f53bfd",
+    "llm_withtools.py": "b50c9ed9217b75b9947ddd0908288cf338d7e58000fa3377b80734b8d7a03174",
+    "tools/__init__.py": "20d623ac2d12119dc46527fdf099bb5c1329e0024ed27a413d2b929ca9888b86",
+    "tools/bash.py": "a11e7b40fe61b3105b88c4370bda1947a4f0f9cef0231a5f279ae917e0f21b02",
+    "tools/edit.py": "cf25d459f5ae3025da1dc67697f43f2984a8b828ebc3d91b3398adfa407470a5",
+    "prompts/tooluse_prompt.py": "79c23086fa7f7d5d5af5b5e7f3988b8bd13da224c8198787c1ff6db9439b066d",
+    "prompts/testrepo_prompt.py": "d72f897bf6627a0eaa8f6037e2380ceb2cd3ddb71dd9f1a523b559a5bb21c8a1",
+    "requirements.txt": "e85ed70436ed8ced4053e40fc048d38cba810c40be026db8c925987c244d6f64",
+    "polyglot/harness.py": "b1819974c8baff5ba9e4d77ffc3721b6d934a5a311a582089bcc80cfadc7a004",
+    "polyglot/constants.py": "4897de8816005c8de538016baeab5070f2cc4c7aa7ad9ddaa0b3035bba801c3c",
+    "polyglot/dockerfiles.py": "67189756ea8bfdc7ec8a938f3aef7bca9d34cda7a6f0f4735eed5a4362cf2189",
+    "polyglot/docker_build.py": "4aeef2f8dfae1f138fa7f8133ee09963536eefe3b881eb090acd01b3e4d64074",
+    "polyglot/docker_utils.py": "52c480c2eca25e54aa8518eca1bd859c436399eeb8645b464d213ea344ecace7",
+    "polyglot/test_spec.py": "f113789b55444c336cd3c82808524c7f26b84ee11393d44bb60a489ae2421743",
+    "polyglot/run_evaluation.py": "0a7259d3568ee67129da5f8cf100940420249541f3997ec07051a9e3eb982497",
+    "utils/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "utils/apptainer_compat.py": "54ea1548b3719677ab8504123e2984f407f68454122c0e710482e70c6a3abce5",
+    "utils/apptainer_errors.py": "f812470729dd51a93fde1fbe515bcb27c9453394494233849938f0994bc14207",
+    "utils/container_runtime.py": "f0053d1908b65c7309a2801c8b7475060026f3f74377e6b62f3db7d5edfadc38",
+    "utils/docker_utils.py": "4f964ba5f173de46e04dfb55bbfcf38e8914128ffd67dfe42cd81949e59cf28b",
+    "utils/host_resources.py": "ad981114b73f3225e5c4b2305c08aa237c79b0f3e8a5d3a750cd9da471cb9290",
+    "utils/secret_redaction.py": "0cb0b3456cbd69d9cb3aef9421172ef990b75d46a8fa34a0027d55ce73085b98",
+    "utils/fs_copy.py": "945e48e25a4c3ebce7d295f6fc8adeba80ed40b310b89af07b6ea0b75bf343d4",
+    "utils/git_utils.py": "3d1daf11712dc0f1235fc8a9219ec69320094ab7460754ea984467c854b44b90",
+    "utils/common_utils.py": "638400ea31f05424bd87f07b51bc7a516ef7929f7ddc0e45f1a8023a3eb851b9",
+    "Dockerfile": "1d85c5dafe3b2adefbd2307d100f5aeb19ad68f43a57e5e69d4091c3ab97a66d",
+    ".dockerignore": "95a065d857a592847212ecb3746e1affd79a3fcf60e318ec8631d5cb494b045f"
+  },
+  "data": {
+    "polyglot/polyglot_benchmark_metadata.json": "3a0edaaa87a459680149aef9caccbbe859b8e1d1ec31419d6d3e8032bd7d1554"
+  },
+  "source_uncommitted": []
+}

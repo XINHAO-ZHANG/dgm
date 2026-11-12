@@ -1,4 +1,4 @@
-"""Host disk and memory gates for the DGM and EvoPilot outer loops.
+"""Host disk and memory gates for the EvoPilot outer loop.
 
 A shared machine can fill ``/tmp`` with Apptainer sandboxes or drive
 memory pressure high enough that user lookup (LDAP/sssd) dies. These
@@ -9,12 +9,20 @@ another sandbox. They do not decide whether a patch is good.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import json
 import os
 import re
 import shutil
+import socket
+import subprocess
 import threading
+import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from utils.secret_redaction import redact_secrets
 
@@ -24,6 +32,9 @@ MARKER_NAME = ".dgm-workspace-owner"
 MIN_FREE_ENV = "DGM_MIN_TMP_FREE_BYTES"
 MIN_MEM_ENV = "DGM_MIN_AVAILABLE_MEM_BYTES"
 PRESSURE_ENV = "DGM_MAX_MEM_PRESSURE"
+UNPACK_RESERVE_ENV = "DGM_UNPACK_RESERVE_BYTES"
+UNPACK_WAIT_ENV = "DGM_UNPACK_WAIT_SECONDS"
+WORKSPACE_ROOT_ENV = "APPTAINER_WORKSPACE_ROOT"
 
 # Headroom for one more generation on a shared host, not a reservation
 # for every parallel sandbox. Raise the CLI values when several eval
@@ -31,6 +42,15 @@ PRESSURE_ENV = "DGM_MAX_MEM_PRESSURE"
 DEFAULT_MIN_TMP_FREE_GIB = 10.0
 DEFAULT_MIN_AVAILABLE_MEM_GIB = 4.0
 DEFAULT_MAX_MEM_PRESSURE_AVG10 = 10.0
+# Room one sandbox unpack holds until it has landed. A Polyglot sandbox is
+# ~4.9 GB once unpacked; the unpack peaked near 8.7 GB on decore2's disk
+# /tmp and near 5.8 GB on tmpfs (2026-11-11).
+DEFAULT_UNPACK_RESERVE_GIB = 9.0
+# A harness sandbox lives at most ~15 min (10 min agent, pip, tests), so an
+# hour without room means someone else holds it.
+DEFAULT_UNPACK_WAIT_SECONDS = 3600.0
+RESERVATIONS_NAME = ".unpack-reservations.json"
+_STALE_RESERVATION_SECONDS = 3 * 3600
 
 DISK_CODE = "resource_exhausted_disk"
 MEMORY_CODE = "resource_exhausted_memory"
@@ -42,9 +62,12 @@ INFRA_APPTAINER = "infra_apptainer_start"
 INFRA_UNHANDLED = "infra_unhandled"
 
 _GIB = 1024 ** 3
+_HOST = socket.gethostname()
 _PROCESS_OWNER = f"pid-{os.getpid()}"
 _OWNED_PATHS: set[str] = set()
 _OWNED_LOCK = threading.Lock()
+# flock excludes threads too, except on NFS where it falls back to per-process locks.
+_BOOK_LOCK = threading.Lock()
 
 _NOSPACE = re.compile(
     r"no space left on device|errno\s*28\b|disk quota exceeded|edquot",
@@ -92,12 +115,18 @@ class ResourceThresholds:
     min_free_bytes: int = int(DEFAULT_MIN_TMP_FREE_GIB * _GIB)
     min_available_memory_bytes: int = int(DEFAULT_MIN_AVAILABLE_MEM_GIB * _GIB)
     max_memory_pressure_avg10: float | None = DEFAULT_MAX_MEM_PRESSURE_AVG10
+    unpack_reserve_bytes: int = int(DEFAULT_UNPACK_RESERVE_GIB * _GIB)
+    # Where sandboxes unpack. None keeps APPTAINER_WORKSPACE_ROOT, else
+    # $TMPDIR/apptainer-workspaces. Not a threshold, but published with them.
+    workspace_root: str | None = None
 
     def to_dict(self) -> dict:
         return {
             "min_free_bytes": self.min_free_bytes,
             "min_available_memory_bytes": self.min_available_memory_bytes,
             "max_memory_pressure_avg10": self.max_memory_pressure_avg10,
+            "unpack_reserve_bytes": self.unpack_reserve_bytes,
+            "workspace_root": self.workspace_root,
         }
 
 
@@ -132,7 +161,7 @@ def format_bytes(n: int) -> str:
 
 
 def add_resource_arguments(parser: argparse.ArgumentParser) -> None:
-    """Flags shared by ``DGM_outer`` and ``EvoPilot_outer``."""
+    """Flags for ``EvoPilot_outer``."""
 
     parser.add_argument(
         "--min-tmp-free-gb",
@@ -164,6 +193,27 @@ def add_resource_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--unpack-reserve-gb",
+        type=float,
+        default=DEFAULT_UNPACK_RESERVE_GIB,
+        help=(
+            "Room each sandbox unpack holds on the workspace root (and in RAM when the root "
+            "is tmpfs) until it has landed, on top of the floors above "
+            f"(default {DEFAULT_UNPACK_RESERVE_GIB:g}). An unpack that does not fit waits. "
+            "Shared by every process of this user unpacking under the same root. 0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-root",
+        default=None,
+        help=(
+            "Directory for sandbox workspaces; sets APPTAINER_WORKSPACE_ROOT. A per-user "
+            "directory on /dev/shm keeps sandboxes in RAM: faster, and not limited by /tmp, "
+            "but every sandbox (~5 GB) then uses memory other jobs on the node may need. "
+            "Default: APPTAINER_WORKSPACE_ROOT, else $TMPDIR/apptainer-workspaces."
+        ),
+    )
+    parser.add_argument(
         "--continue-on-infra-error",
         action="store_true",
         help=(
@@ -187,6 +237,10 @@ def thresholds_from_args(args: argparse.Namespace) -> ResourceThresholds:
             float(getattr(args, "min_available_mem_gb", DEFAULT_MIN_AVAILABLE_MEM_GIB))
         ),
         max_memory_pressure_avg10=None if pressure < 0 else pressure,
+        unpack_reserve_bytes=gib_to_bytes(
+            float(getattr(args, "unpack_reserve_gb", DEFAULT_UNPACK_RESERVE_GIB))
+        ),
+        workspace_root=getattr(args, "workspace_root", None) or None,
     )
 
 
@@ -199,6 +253,9 @@ def publish_resource_policy(thresholds: ResourceThresholds) -> None:
         os.environ[PRESSURE_ENV] = "-1"
     else:
         os.environ[PRESSURE_ENV] = str(thresholds.max_memory_pressure_avg10)
+    os.environ[UNPACK_RESERVE_ENV] = str(int(thresholds.unpack_reserve_bytes))
+    if thresholds.workspace_root:
+        os.environ[WORKSPACE_ROOT_ENV] = os.path.abspath(thresholds.workspace_root)
 
 
 def thresholds_from_env() -> ResourceThresholds:
@@ -218,6 +275,8 @@ def thresholds_from_env() -> ResourceThresholds:
         min_free_bytes=max(0, _int(MIN_FREE_ENV, int(DEFAULT_MIN_TMP_FREE_GIB * _GIB))),
         min_available_memory_bytes=max(0, _int(MIN_MEM_ENV, int(DEFAULT_MIN_AVAILABLE_MEM_GIB * _GIB))),
         max_memory_pressure_avg10=pressure,
+        unpack_reserve_bytes=max(0, _int(UNPACK_RESERVE_ENV, int(DEFAULT_UNPACK_RESERVE_GIB * _GIB))),
+        workspace_root=os.environ.get(WORKSPACE_ROOT_ENV) or None,
     )
 
 
@@ -336,7 +395,7 @@ def sweep_abandoned_workspaces(
             looks_sandbox = (not entries) or names <= {"rootfs", ".env", "env"} or "rootfs" in names
             if not looks_sandbox:
                 continue
-            shutil.rmtree(child, ignore_errors=True)
+            remove_tree(child)
             if not child.exists():
                 removed.append(str(child))
 
@@ -360,7 +419,7 @@ def sweep_abandoned_workspaces(
                     if child.is_symlink():
                         continue
                     if child.is_dir():
-                        shutil.rmtree(child, ignore_errors=True)
+                        remove_tree(child)
                     else:
                         child.unlink(missing_ok=True)
                     if not child.exists():
@@ -409,7 +468,7 @@ def cleanup_owned_workspaces(
                 continue
         elif not noted_here:
             continue
-        shutil.rmtree(child, ignore_errors=True)
+        remove_tree(child)
         if not child.exists():
             removed.append(str(child))
             with _OWNED_LOCK:
@@ -427,14 +486,15 @@ def _existing_anchor(path: str) -> str | None:
     return current
 
 
-def paths_to_check() -> list[str]:
+def paths_to_check(extra: list[str] | None = None) -> list[str]:
     """``/tmp`` plus any configured temp or Apptainer workspace root."""
 
     requested = ["/tmp"]
-    for key in ("TMPDIR", "APPTAINER_TMPDIR", "APPTAINER_WORKSPACE_ROOT"):
+    for key in ("TMPDIR", "APPTAINER_TMPDIR", WORKSPACE_ROOT_ENV):
         value = os.environ.get(key, "").strip()
         if value:
             requested.append(value)
+    requested.extend(item for item in (extra or []) if item)
     labels: list[str] = []
     seen: set[str] = set()
     for item in requested:
@@ -585,9 +645,205 @@ def require_resources_from_env(*, phase: str) -> ResourceSnapshot:
     return require_resources(thresholds_from_env(), phase=phase)
 
 
+def filesystem_type(path: os.PathLike | str, mounts: str | None = None) -> str | None:
+    """Type of the mount holding ``path`` (``tmpfs`` for /dev/shm), from /proc/mounts."""
+
+    anchor = _existing_anchor(os.fspath(path))
+    if anchor is None:
+        return None
+    target = os.path.realpath(anchor)
+    if mounts is None:
+        try:
+            mounts = Path("/proc/mounts").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+    lines = mounts.splitlines()
+    best, kind = "", None
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mount = parts[1].replace("\\040", " ")
+        inside = target == mount or target.startswith(mount.rstrip("/") + "/")
+        if inside and len(mount) >= len(best):
+            best, kind = mount, parts[2]
+    return kind
+
+
+def _reservation_live(record: dict, now: float) -> bool:
+    try:
+        since = float(record.get("since", 0))
+        pid = int(record.get("pid", 0))
+    except (TypeError, ValueError):
+        return False
+    if now - since > _STALE_RESERVATION_SECONDS:
+        return False
+    if record.get("host") == _HOST and pid > 0:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+    return True
+
+
+@contextmanager
+def _reservation_book(root: Path) -> Iterator[dict]:
+    """The unpacks in flight under ``root``, locked; changes are written back."""
+
+    path = root / RESERVATIONS_NAME
+    with _BOOK_LOCK:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        with os.fdopen(fd, "r+", encoding="utf-8") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                try:
+                    loaded = json.loads(handle.read() or "{}")
+                except ValueError:
+                    loaded = {}
+                now = time.time()
+                book = {
+                    key: record
+                    for key, record in (loaded.items() if isinstance(loaded, dict) else [])
+                    if isinstance(record, dict) and _reservation_live(record, now)
+                }
+                yield book
+                handle.seek(0)
+                handle.truncate()
+                handle.write(json.dumps(book))
+                handle.flush()
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _unpack_short(
+    snapshot: ResourceSnapshot,
+    thresholds: ResourceThresholds,
+    *,
+    held: int,
+    need: int,
+    in_ram: bool,
+) -> tuple[str, str] | None:
+    """Why this unpack cannot start yet, or None."""
+
+    for label, free in snapshot.paths.items():
+        if free is not None and free - held - need < thresholds.min_free_bytes:
+            return DISK_CODE, (
+                f"{label} has {format_bytes(free)} free, {format_bytes(held)} held by unpacks in "
+                f"flight; an unpack needs {format_bytes(need)} above the "
+                f"{format_bytes(thresholds.min_free_bytes)} floor"
+            )
+    mem = snapshot.mem_available_bytes
+    if in_ram and mem is not None and mem - held - need < thresholds.min_available_memory_bytes:
+        return MEMORY_CODE, (
+            f"the workspace root is in RAM; MemAvailable is {format_bytes(mem)}, "
+            f"{format_bytes(held)} held by unpacks in flight; an unpack needs "
+            f"{format_bytes(need)} above the {format_bytes(thresholds.min_available_memory_bytes)} floor"
+        )
+    return None
+
+
+@contextmanager
+def unpack_room(
+    root: os.PathLike | str,
+    *,
+    thresholds: ResourceThresholds | None = None,
+    probe=None,
+    poll: float = 5.0,
+    wait_limit: float | None = None,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> Iterator[float]:
+    """Hold room on the workspace root while one sandbox unpacks; yields the seconds waited.
+
+    The gate reads free space once per sandbox. Workers that pass it together
+    then unpack together, ~9 GB each on disk, and two of them took decore2's
+    /tmp to 0 bytes free (2026-11-11). Here each unpack in flight is written
+    to a book under the root that every process of this user unpacking there
+    reads, and an unpack starts only when free space, less the room the book
+    holds, still covers its own need above the floor. When the root is tmpfs
+    the sandbox lives in RAM, so MemAvailable is held the same way. The room is
+    released when the unpack ends; from then on the sandbox shows in free
+    space. Waits up to ``DGM_UNPACK_WAIT_SECONDS`` (default one hour), then
+    raises ``ResourceGateError``.
+    """
+
+    chosen = thresholds if thresholds is not None else thresholds_from_env()
+    need = chosen.unpack_reserve_bytes
+    if need <= 0:
+        yield 0.0
+        return
+    base = Path(root)
+    base.mkdir(parents=True, exist_ok=True)
+    in_ram = filesystem_type(base) in ("tmpfs", "ramfs")
+    measure = probe if probe is not None else (lambda: snapshot_resources([str(base)]))
+    if wait_limit is None:
+        try:
+            wait_limit = float(os.environ.get(UNPACK_WAIT_ENV) or DEFAULT_UNPACK_WAIT_SECONDS)
+        except ValueError:
+            wait_limit = DEFAULT_UNPACK_WAIT_SECONDS
+    key = f"{_HOST}:{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex[:8]}"
+    started = clock()
+    while True:
+        with _reservation_book(base) as book:
+            held = sum(int(record.get("bytes", 0)) for record in book.values())
+            snapshot = measure()
+            short = _unpack_short(snapshot, chosen, held=held, need=need, in_ram=in_ram)
+            if short is None:
+                book[key] = {"bytes": need, "host": _HOST, "pid": os.getpid(), "since": time.time()}
+                break
+        waited = clock() - started
+        if waited >= wait_limit:
+            code, detail = short
+            raise ResourceGateError(
+                code,
+                f"refusing a sandbox unpack after waiting {waited:.0f}s: {detail}. "
+                "No new Apptainer sandbox will be started.",
+                snapshot,
+            )
+        sleep(poll)
+    try:
+        yield clock() - started
+    finally:
+        with _reservation_book(base) as book:
+            book.pop(key, None)
+
+
+def remove_tree(path: os.PathLike | str) -> None:
+    """Delete a directory tree with ``rm -rf`` in a child process.
+
+    A sandbox rootfs holds ~180k files. ``shutil.rmtree`` unlinks them one
+    by one in Python under the GIL, so harness threads removing sandboxes at
+    the same time take turns: 8 threads took 25 s for trees one thread removes
+    in 2.2 s, and at 24 workers removal took 91 s per sandbox on lig-gpu1
+    (median). ``rm -rf`` runs outside the GIL (the same 8 trees: 1.8 s).
+    Falls back to ``shutil.rmtree`` when ``rm`` is missing or leaves something.
+    """
+
+    target = os.fspath(path)
+    if not os.path.lexists(target):
+        return
+    try:
+        subprocess.run(
+            ["rm", "-rf", "--", target],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+    if os.path.lexists(target):
+        shutil.rmtree(target, ignore_errors=True)
+
+
 def resource_check_report(thresholds: ResourceThresholds | None = None) -> dict:
     chosen = thresholds if thresholds is not None else thresholds_from_env()
-    snapshot = snapshot_resources()
+    # --workspace-root is published only when a run starts.
+    if chosen.workspace_root:
+        snapshot = snapshot_resources(paths_to_check([chosen.workspace_root]))
+    else:
+        snapshot = snapshot_resources()
     code, detail = assess_resources(chosen, snapshot)
     message = detail if code is None else (
         f"refusing improve: {detail}. "
@@ -644,6 +900,22 @@ def stop_reason_for_infra(metadatas, *, continue_on_infra: bool) -> str | None:
         code = metadata.get("infra_error_code")
         if code:
             return str(code)
+    return None
+
+
+def finished_result(path: os.PathLike) -> dict | None:
+    """A stored task result worth keeping on a rerun, or None to run it again.
+
+    A failed build or a full disk also leaves a result file. Reusing it would
+    make a resumed evaluation count that problem as done without running it.
+    """
+
+    try:
+        result = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(result, dict) and result.get("success"):
+        return result
     return None
 
 

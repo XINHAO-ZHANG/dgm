@@ -366,7 +366,7 @@ def _dgm_child(output_dir, code):
 def _patch_dgm(monkeypatch, tmp_path, improve, require):
     monkeypatch.setenv("DGM_OUTPUT_ROOT", str(tmp_path / "output_dgm"))
 
-    def fake_initialize(output_dir, prevrun_dir=None, polyglot=False):
+    def fake_initialize(output_dir, prevrun_dir=None, polyglot=False, initial_dir=None):
         os.makedirs(os.path.join(output_dir, "initial"), exist_ok=True)
         with open(os.path.join(output_dir, "initial", "metadata.json"), "w", encoding="utf-8") as handle:
             json.dump(

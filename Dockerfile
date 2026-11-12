@@ -1,4 +1,5 @@
-# Use an official Python runtime as the base image
+# EvoPilot self-improve image.
+# The workdir stays /dgm: the Polyglot agent and harness call that path.
 FROM python:3.10-slim
 
 # Install system-level dependencies, including git

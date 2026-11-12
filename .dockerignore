@@ -1,3 +1,11 @@
+# Build context of the self-improve image (COPY . . into /dgm).
+# The self-editing agent sees what gets through, so this keeps the agent itself:
+# coding_agent_polyglot.py, llm.py, llm_withtools.py, tools/, utils/, the agent's
+# prompts, and requirements.txt. Controllers, tests, scripts, and docs stay on the
+# host. ../dgm syncs this file (scripts/sync_runtime.py there) so the DGM
+# baseline's self-edit sees the same files; paths found in only one of the two
+# repositories are listed here as well.
+
 __pycache__/
 **/__pycache__/
 *.pyc
@@ -5,38 +13,50 @@ __pycache__/
 .vscode
 .env
 .ipynb
+.pytest_cache/
+.claude/
 
-<!-- swe-bench -->
 logs/
-swe_bench/
 initial/
+initial_polyglot/
+initial_polyglot_*/
 
-<!-- polyglot -->
+# The eval harness is copied into task sandboxes by polyglot/harness.py.
+# Keep it out of the self-improve image.
 polyglot/
-aider_polyglot.json
 
-<!-- outputs -->
 output_selfimprove/
 output_dgm/
+output_evopilot/
 output_peer_review/
-initial_polyglot/
+output_polyglot_dry/
 
-<!-- misc -->
-misc/
-README.md
+# Docs anywhere (README, CLAUDE, ALIGNMENT, ...): the agent's code has none.
+*.md
+NOTICE
+LICENSE
 Dockerfile
 .dockerignore
 requirements_dev.txt
+pytest.ini
+EVOPILOT_RUNTIME.json
 
-<!-- code outside of coding agent -->
-test_swebench.py
+# Outer loops, controllers, tests, and scripts stay on the host. The sandbox
+# runs the Polyglot coding agent.
+EvoPilot_outer.py
 DGM_outer.py
 self_improve_step.py
+evopilot/
+tests/
+scripts/
+apptainer/
+apptainer_images/
 analysis/
+misc/
+swe_bench/
+test_swebench.py
 prompts/self_improvement_prompt.py
 prompts/diagnose_improvement_prompt.py
 utils/evo_utils.py
 utils/docker_utils.py
 venv/
-output_evopilot/
-output_polyglot_dry/

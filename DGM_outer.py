@@ -37,7 +37,7 @@ def log_selfimprove_failure(logger, exc: BaseException) -> None:
     logger.error("Self-improvement step failed: %s", redact_secrets(str(exc)))
     logger.error("Traceback:\n%s", redact_secrets(traceback.format_exc()))
 
-def initialize_run(output_dir, prevrun_dir=None, polyglot=False):
+def initialize_run(output_dir, prevrun_dir=None, polyglot=False, initial_dir=None):
     # Initialize archive
     start_gen_num = 0
     if not prevrun_dir:
@@ -50,7 +50,7 @@ def initialize_run(output_dir, prevrun_dir=None, polyglot=False):
         start_gen_num = metadata['generation'] + 1
 
     # Copy cached initial version into experiment dir
-    initial_folder_name = 'initial' if not polyglot else 'initial_polyglot'
+    initial_folder_name = initial_dir or ('initial' if not polyglot else 'initial_polyglot')
     if not prevrun_dir and not os.path.exists(f"{output_dir}/{initial_folder_name}"):
         if os.path.exists(initial_folder_name):
             os.system(f"cp -r {initial_folder_name}/ {output_dir}/initial")
@@ -243,6 +243,51 @@ def get_full_eval_threshold(output_dir, archive):
 
     return threshold
 
+def load_split_screen(split_path):
+    """DGM's two-stage screen on EvoPilot's split: bucket 1, then buckets 2-5.
+
+    Upstream DGM scores every child on small.json and, past the 40% gate, on
+    medium.json. Under the split the same stages run on the evaluation buckets,
+    which never include a held-out or diagnosis-pool problem. The two stages do
+    not overlap, so every evaluation problem counts once. Parent selection and
+    the problem a diagnosis reads use the first stage, as upstream.
+    """
+
+    with open(split_path, "r", encoding="utf-8") as handle:
+        split = json.load(handle)
+    buckets = [list(bucket) for bucket in split["eval_buckets"]]
+    if len(buckets) < 2:
+        raise RuntimeError(f"{split_path} needs at least two evaluation buckets for DGM's two stages.")
+    first = buckets[0]
+    rest = [instance_id for bucket in buckets[1:] for instance_id in bucket]
+    held = set(split.get("heldout") or ()) | set(split.get("diagnosis_pool") or ())
+    leaked = sorted(held & set(first + rest))
+    if leaked:
+        raise RuntimeError(f"{split_path}: evaluation buckets overlap held-out or pool problems ({', '.join(leaked[:3])}).")
+    return first, rest
+
+
+def check_alignment(split_path, initial_dir):
+    """Refuse an aligned run whose runtime or initial cache does not match the split and EvoPilot."""
+
+    import hashlib
+
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+    from sync_runtime import runtime_mismatches
+
+    problems = list(runtime_mismatches())
+    metadata_path = os.path.join(initial_dir, "metadata.json")
+    if not os.path.isfile(metadata_path):
+        problems.append(f"{metadata_path} (missing: run scripts/build_initial_from_baseline.py)")
+    else:
+        with open(split_path, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+        if (load_json_file(metadata_path).get("source") or {}).get("split_sha256") != digest:
+            problems.append(f"{metadata_path} was built from another split")
+    if problems:
+        raise RuntimeError("The aligned DGM baseline cannot start:\n- " + "\n- ".join(problems))
+
+
 def main(argv=None):
     # Imported here so the failure logger can be unit-tested without the model stack.
     from self_improve_step import self_improve
@@ -267,6 +312,16 @@ def main(argv=None):
     parser.add_argument("--no_full_eval", default=False, action='store_true', help="Do not run full evaluation on swe if a node is the top N highest performing.")
     # baselines
     parser.add_argument("--run_baseline", type=str, default=None, choices=['no_selfimprove', 'no_darwin'], help="Baseline to run.")
+    # Alignment with EvoPilot (Polyglot only); see ALIGNMENT.md.
+    parser.add_argument(
+        "--split", type=str, default=None,
+        help="EvoPilot split file: evaluate on its buckets (bucket 1, then 2-5) instead of small/medium.json. "
+             "Needs a runtime synced from EvoPilot and an initial cache built from the same split.",
+    )
+    parser.add_argument(
+        "--initial_dir", type=str, default=None,
+        help="Cached evaluation of the initial agent (default initial_polyglot/, or initial/ for SWE-bench).",
+    )
     add_resource_arguments(parser)
     args = parser.parse_args(argv)
     if args.dry_resource_check:
@@ -285,11 +340,21 @@ def main(argv=None):
     output_dir = os.path.join(output_root, run_id)
     os.makedirs(output_dir, exist_ok=True)
 
+    # Aligned with EvoPilot: same runtime, its split, and a qwen initial cache.
+    if args.split:
+        if not args.polyglot:
+            raise RuntimeError("--split is Polyglot only; pass --polyglot.")
+        check_alignment(args.split, args.initial_dir or "initial_polyglot")
+
     # Initialize
-    archive, start_gen_num = initialize_run(output_dir, prevrun_dir=args.continue_from, polyglot=args.polyglot)
+    archive, start_gen_num = initialize_run(
+        output_dir, prevrun_dir=args.continue_from, polyglot=args.polyglot, initial_dir=args.initial_dir,
+    )
 
     # SWE issues to consider
-    if not args.polyglot:
+    if args.split:
+        swe_issues_sm, swe_issues_med = load_split_screen(args.split)
+    elif not args.polyglot:
         swe_issues_sm = load_json_file("./swe_bench/subsets/small.json")
         swe_issues_med = load_json_file("./swe_bench/subsets/medium.json")
     else:
@@ -300,6 +365,12 @@ def main(argv=None):
     logger = setup_logger(os.path.join(output_dir, "dgm_outer.log"))
     logger.info(f"Starting DGM run {run_id} with arguments: {vars(args)}")
     logger.info(f"Archive: {archive}")
+    if args.split:
+        logger.info(
+            f"Aligned with EvoPilot: split={os.path.abspath(args.split)} stage1={len(swe_issues_sm)} "
+            f"stage2={len(swe_issues_med)} initial={args.initial_dir or 'initial_polyglot'} "
+            f"runtime={load_json_file('EVOPILOT_RUNTIME.json').get('source_commit')}"
+        )
     thresholds = thresholds_from_args(args)
     owner = ensure_workspace_owner(output_dir)
     publish_resource_policy(thresholds)

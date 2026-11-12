@@ -129,8 +129,11 @@ def _run_apptainer(
     check: bool = True,
 ) -> subprocess.CompletedProcess:
     cmd = [get_apptainer_bin()] + args
+    # No terminal, as under Docker. Started from tmux, a RUN step that asks for
+    # input (add-apt-repository without -y) would otherwise wait until the timeout.
     return subprocess.run(
         cmd,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=False,
         timeout=timeout,
@@ -177,6 +180,20 @@ def _update_workdir(current: str, arg: str) -> str:
         base = current.rstrip("/") or "/"
         new = f"{base}/{arg}" if base != "/" else f"/{arg}"
     return new.rstrip("/") or "/"
+
+
+def _isolated_run_step(command: str) -> str:
+    """One ``RUN`` as a post-script step that behaves as it does under Docker.
+
+    Docker checks each ``RUN``'s exit status in its own shell. Joined into one
+    ``set -e`` script they lose that: ``set -e`` ignores a failure that is not
+    the last command of an ``&&`` list, so a failed install skips the rest of
+    its line and the build goes on to produce an image missing that software.
+    The subshell makes the whole step's status count, and keeps a ``cd`` or
+    ``export`` from leaking into later steps. The newline before ``)`` keeps a
+    trailing comment from swallowing it.
+    """
+    return f"(\n{command}\n) || exit $?"
 
 
 def _parse_dockerfile_instructions(
@@ -235,14 +252,17 @@ def _parse_dockerfile_instructions(
         if instr == "ADD":
             add_parts = payload.split(None, 1)
             if len(add_parts) == 2 and add_parts[0].startswith("http"):
-                run_lines.append(f'curl -fsSL "{add_parts[0]}" -o {add_parts[1]}')
+                run_lines.append(
+                    _isolated_run_step(f'curl -fsSL "{add_parts[0]}" -o {add_parts[1]}')
+                )
             continue
         if instr == "RUN":
-            run_lines.append(payload.strip())
+            run_lines.append(_isolated_run_step(payload.strip()))
             continue
         if instr == "WORKDIR":
             workdir = _update_workdir(workdir, payload)
-            run_lines.append(f"mkdir -p {shlex.quote(workdir)} && cd {shlex.quote(workdir)}")
+            # Not isolated: WORKDIR is the one step whose cd must persist.
+            run_lines.append(f"mkdir -p {shlex.quote(workdir)} && cd {shlex.quote(workdir)} || exit $?")
 
     return from_ref, copy_steps, env_lines, run_lines
 
@@ -260,11 +280,21 @@ def _dockerignore_patterns(context: Path) -> List[str]:
     return patterns
 
 
-def _path_ignored(rel: str, patterns: List[str]) -> bool:
-    """Best-effort ``.dockerignore`` match for build-context copies."""
+def _path_ignored(rel: str, patterns: List[str], is_dir: Optional[bool] = None) -> bool:
+    """Best-effort ``.dockerignore`` match for build-context copies.
+
+    A pattern ending in "/" names a directory. ``is_dir`` says whether ``rel`` is
+    one; when it is not given, a top-level name with a dot after its first
+    character is taken for a file.
+    """
     import fnmatch
 
-    rel = rel.replace("\\", "/").lstrip("./")
+    rel = rel.replace("\\", "/")
+    # Drop a leading "./" or "/" only: lstrip("./") would also eat the dot of
+    # ".claude" or ".env", and patterns for dotfiles would never match.
+    while rel.startswith("./"):
+        rel = rel[2:]
+    rel = rel.lstrip("/")
     name = rel.rsplit("/", 1)[-1]
     ignored = False
     for pat in patterns:
@@ -280,8 +310,9 @@ def _path_ignored(rel: str, patterns: List[str]) -> bool:
             or fnmatch.fnmatch(name, glob_body)
             or fnmatch.fnmatch(rel, glob_body.rstrip("/") + "/*")
         )
-        if directory_only and matched and "." in name and "/" not in rel:
-            matched = False
+        if directory_only and matched and "/" not in rel:
+            if is_dir is False or (is_dir is None and "." in name.lstrip(".")):
+                matched = False
         if matched:
             ignored = not negate
     return ignored
@@ -291,7 +322,7 @@ def _copy_context_tree(src: Path, dst: Path, context: Path, patterns: List[str])
     dst.mkdir(parents=True, exist_ok=True)
     for child in sorted(src.iterdir()):
         rel = str(child.relative_to(context))
-        if patterns and _path_ignored(rel, patterns):
+        if patterns and _path_ignored(rel, patterns, is_dir=child.is_dir() and not child.is_symlink()):
             continue
         target = dst / child.name
         if child.is_dir() and not child.is_symlink():
@@ -549,6 +580,8 @@ def _build_sif_from_dockerfile(
             "#!/bin/bash",
             "set -euxo pipefail",
             "export HOME=/root",
+            "export DEBIAN_FRONTEND=noninteractive",
+            "cd /",
         ]
         for env in env_lines:
             if "=" in env:
@@ -568,7 +601,15 @@ def _build_sif_from_dockerfile(
             # Flags differ from runtime exec: no --contain, so /root stays the
             # sandbox directory that COPY just filled.
             exec_args = _post_script_exec_args(sandbox)
-            proc = _run_apptainer(exec_args, timeout=timeout, check=False)
+            try:
+                proc = _run_apptainer(exec_args, timeout=timeout, check=False)
+            except subprocess.TimeoutExpired as exc:
+                # Without this, a hung step leaves no sign of which one it was.
+                _raise_build_failure(
+                    f"apptainer Dockerfile post script timed out after {timeout}s for {tag}",
+                    _process_output(exc),
+                    logs,
+                )
             post_output = _process_output(proc)
             if proc.returncode != 0:
                 _raise_build_failure(
@@ -598,6 +639,7 @@ def _build_sif_from_dockerfile(
         build_args.extend([str(sif), str(sandbox)])
         proc = subprocess.Popen(
             [get_apptainer_bin()] + build_args,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
@@ -1031,18 +1073,21 @@ class ApptainerContainer:
         self._network_mode = network_mode
         self._platform = platform
         self._workspace = get_workspace_root() / _sanitize_tag(name)
-        if self._workspace.exists():
-            shutil.rmtree(self._workspace, ignore_errors=True)
-        self._workspace.mkdir(parents=True, exist_ok=True)
         # Owner marker only. Cleanup after a generation removes this run's
         # directories and leaves every other marker (and unmarked dirs) in place.
-        from utils.host_resources import stamp_workspace
+        from utils.host_resources import remove_tree, stamp_workspace
+
+        if self._workspace.exists():
+            remove_tree(self._workspace)
+        self._workspace.mkdir(parents=True, exist_ok=True)
 
         stamp_workspace(self._workspace, name=name)
         self._binds: Dict[str, Path] = {}
         self._started = False
         self._instance_name: Optional[str] = None
         self._lock = threading.Lock()
+        # Seconds the unpack waited for room (utils.host_resources.unpack_room).
+        self.unpack_wait_seconds = 0.0
 
     def _sif(self) -> Path:
         return self.client.images.ensure(self.image_ref, pull=True)
@@ -1057,18 +1102,23 @@ class ApptainerContainer:
         sandbox = self._sandbox_dir()
         if sandbox is not None:
             return sandbox
+        from utils.host_resources import remove_tree, unpack_room
+
         sandbox = self._workspace / "rootfs"
         sif = self._sif()
         if sandbox.exists():
-            shutil.rmtree(sandbox, ignore_errors=True)
+            remove_tree(sandbox)
         # Unpack can exceed the 600s client/exec timeout (esp. on NFS). Use the
         # same build budget as Dockerfile sandbox builds, not client.timeout.
         build_timeout = dockerfile_build_timeout(self.client.timeout)
-        proc = _run_apptainer(
-            ["build", "--sandbox", str(sandbox), str(sif)],
-            timeout=build_timeout,
-            check=False,
-        )
+        # Concurrent unpacks can fill the workspace root between two gate checks.
+        with unpack_room(self._workspace.parent) as waited:
+            self.unpack_wait_seconds = waited
+            proc = _run_apptainer(
+                ["build", "--sandbox", str(sandbox), str(sif)],
+                timeout=build_timeout,
+                check=False,
+            )
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace")
             raise container_errors.APIError(f"apptainer sandbox build failed: {err}")
@@ -1115,7 +1165,7 @@ class ApptainerContainer:
         if workdir:
             args.extend(["--pwd", workdir])
         # Do not put KEY=value on argv. TimeoutExpired and CalledProcessError
-        # stringify the command, and that string is what DGM_outer logs.
+        # stringify the command, and that string is what the outer loop logs.
         # Apptainer reads the same variables from --env-file. Docker call
         # sites still pass an environment dict; only this shim was copying
         # those values onto the command line.
@@ -1153,7 +1203,9 @@ class ApptainerContainer:
         if isinstance(registry, dict):
             registry.pop(self.name, None)
         if self._workspace.exists():
-            shutil.rmtree(self._workspace, ignore_errors=True)
+            from utils.host_resources import remove_tree
+
+            remove_tree(self._workspace)
 
     def exec_run(
         self,

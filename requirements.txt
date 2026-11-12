@@ -5,17 +5,15 @@ backoff
 botocore
 boto3
 openai
+tqdm
 
-# SWE-Bench
-beautifulsoup4
-chardet
+# Polyglot harness and self-improve container client.
+# polyglot/test_spec.py and polyglot/run_evaluation.py also import the
+# upstream swebench package (helpers adapted from SWE-bench). Install that
+# package separately for a live evaluation; see README.md. It is not imported
+# by the unit tests.
 docker
-ghapi
 GitPython
-pre-commit
-python-dotenv
-rich
-unidiff
 
 # pytest
 pytest

@@ -202,6 +202,6 @@ def tool_function(
 
 if __name__ == "__main__":
     # Example usage (absolute path required by validate_path)
-    sample = Path(__file__).resolve().parent.parent / "coding_agent.py"
+    sample = Path(__file__).resolve().parent.parent / "coding_agent_polyglot.py"
     result = tool_function("view", str(sample), view_range=[1, 10])
     print(result)
