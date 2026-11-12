@@ -165,6 +165,55 @@ def test_self_improve_refuses_api_and_sandbox_when_tmp_is_low(monkeypatch, tmp_p
     assert DISK_CODE in blob
 
 
+def test_self_improve_records_an_unpack_that_gave_up(monkeypatch, tmp_path):
+    """The first exec unpacks the sandbox; giving up there is a gate refusal, not a crash."""
+    import self_improve_step
+    from self_improve_step import self_improve
+
+    workdir = tmp_path / "repo"
+    (workdir / "swe_bench" / "subsets").mkdir(parents=True)
+    (workdir / "swe_bench" / "subsets" / "big.json").write_text("[]", encoding="utf-8")
+    (workdir / "polyglot").mkdir()
+    (workdir / "polyglot" / "polyglot_benchmark_metadata.json").write_text("[]", encoding="utf-8")
+    monkeypatch.chdir(workdir)
+    monkeypatch.setattr(self_improve_step, "dataset", None)
+
+    class Container:
+        def __init__(self):
+            self.commands = []
+
+        def start(self):
+            pass
+
+        def exec_run(self, command, workdir=None):
+            self.commands.append(command)
+            raise ResourceGateError(DISK_CODE, "refusing a sandbox unpack after waiting 3600s", None)
+
+    container = Container()
+    removed = []
+
+    def forbid_diagnose(*_args, **_kwargs):
+        raise AssertionError("diagnose should not call the model")
+
+    monkeypatch.setattr("self_improve_step.require_resources_from_env", lambda *, phase: None)
+    monkeypatch.setattr("self_improve_step.docker_from_env", lambda: object())
+    monkeypatch.setattr("self_improve_step.remove_existing_container", lambda *_args: None)
+    monkeypatch.setattr("self_improve_step.build_dgm_container", lambda *_args, **_kwargs: container)
+    monkeypatch.setattr("self_improve_step.cleanup_container", removed.append)
+    monkeypatch.setattr("self_improve_step.diagnose_problem", forbid_diagnose)
+
+    metadata = self_improve(
+        parent_commit="initial",
+        output_dir=str(tmp_path / "out"),
+        entry="go__poker",
+        polyglot=True,
+    )
+    assert metadata["infra_error_code"] == DISK_CODE
+    assert len(container.commands) == 1
+    assert removed == [container]
+    assert list((tmp_path / "out").glob("*/metadata.json"))
+
+
 def test_verify_gate_runs_before_the_polyglot_harness(monkeypatch, tmp_path):
     from self_improve_step import run_harness_polyglot
 

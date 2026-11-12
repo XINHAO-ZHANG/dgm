@@ -322,9 +322,27 @@ def self_improve(
             force_rebuild=force_rebuild,
         )
         container.start()
+        # Under Apptainer the first exec unpacks the sandbox, which may wait for
+        # room and give up (ResourceGateError), so the setup execs stay inside
+        # this handler and a refusal is recorded with the gate's code.
+        if polyglot:
+            # remove the swe version of coding_agent.py
+            exec_result = container.exec_run("rm /dgm/coding_agent.py", workdir='/')
+            log_container_output(exec_result)
+            # rename coding_agent_polyglot.py to coding_agent.py
+            exec_result = container.exec_run("mv /dgm/coding_agent_polyglot.py /dgm/coding_agent.py", workdir='/')
+            log_container_output(exec_result)
+            # remove swe-specific files utils/eval_utils.py and utils/swe_log_parsers.py
+            exec_result = container.exec_run("rm /dgm/utils/eval_utils.py", workdir='/')
+            log_container_output(exec_result)
+            exec_result = container.exec_run("rm /dgm/utils/swe_log_parsers.py", workdir='/')
+            log_container_output(exec_result)
+        else:
+            # remove the polyglot version of coding_agent.py
+            exec_result = container.exec_run("rm /dgm/coding_agent_polyglot.py", workdir='/')
     except Exception as exc:
         text = f"{type(exc).__name__}: {exc}"
-        code = classify_infra_error(text) or "infra_apptainer_start"
+        code = (exc.code if isinstance(exc, ResourceGateError) else classify_infra_error(text)) or "infra_apptainer_start"
         apply_infra_metadata(metadata, code, text)
         safe_log(f"Apptainer/container start failed: {metadata['error']}")
         if container is not None:
@@ -334,22 +352,6 @@ def self_improve(
                 safe_log(f"Error cleaning up container after start failure: {cleanup_error}")
         save_metadata(metadata, output_dir)
         return metadata
-
-    if polyglot:
-        # remove the swe version of coding_agent.py
-        exec_result = container.exec_run("rm /dgm/coding_agent.py", workdir='/')
-        log_container_output(exec_result)
-        # rename coding_agent_polyglot.py to coding_agent.py
-        exec_result = container.exec_run("mv /dgm/coding_agent_polyglot.py /dgm/coding_agent.py", workdir='/')
-        log_container_output(exec_result)
-        # remove swe-specific files utils/eval_utils.py and utils/swe_log_parsers.py
-        exec_result = container.exec_run("rm /dgm/utils/eval_utils.py", workdir='/')
-        log_container_output(exec_result)
-        exec_result = container.exec_run("rm /dgm/utils/swe_log_parsers.py", workdir='/')
-        log_container_output(exec_result)
-    else:
-        # remove the polyglot version of coding_agent.py
-        exec_result = container.exec_run("rm /dgm/coding_agent_polyglot.py", workdir='/')
 
     # Find all parent patches and apply them
     patch_files = get_model_patch_paths(root_dir, os.path.join(output_dir, '../'), parent_commit)
