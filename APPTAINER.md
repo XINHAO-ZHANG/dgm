@@ -87,7 +87,7 @@ The Dockerfile post script does **not** use `--contain`. With `--fakeroot`, that
 
 ## Shared-host resource gate
 
-`DGM_outer.py` and `EvoPilot_outer.py` check the host before Improve (the model call) and before Verify (another Apptainer sandbox). A failing check returns immediately: no OpenRouter call and no new sandbox.
+`DGM_outer.py` checks the host before Improve (the model call) and before Verify (another Apptainer sandbox). A failing check returns immediately: no OpenRouter call and no new sandbox.
 
 | Flag | Default | Effect |
 | --- | --- | --- |
@@ -95,14 +95,15 @@ The Dockerfile post script does **not** use `--contain`. With `--fakeroot`, that
 | `--min-available-mem-gb` | 4 | `MemAvailable` floor. `0` disables it. |
 | `--max-mem-pressure` | 10 | Maximum `/proc/pressure/memory` `full` avg10, in percent. Negative disables the check. A missing PSI file is ignored. |
 | `--continue-on-infra-error` | off | After nospace, memory, LDAP/userid, or Apptainer start failure, start the next generation. The disk and memory gates still apply. |
+| `--unpack-reserve-gb` | 9 | Room each sandbox unpack holds on the workspace root until it has landed, on top of `--min-tmp-free-gb` (and of `--min-available-mem-gb` when the root is tmpfs). An unpack that does not fit waits; after `DGM_UNPACK_WAIT_SECONDS` (3600) it is refused like a failed gate. `0` disables. |
+| `--workspace-root` | unset | Sets `APPTAINER_WORKSPACE_ROOT` for the run, e.g. `/dev/shm/$USER-apptainer-ws` to keep sandboxes in RAM (~5 GB each). Measurements are in EvoPilot's `APPTAINER.md`. |
 | `--dry-resource-check` | off | Print the snapshot and exit `0` when the gates would allow a generation, or `2` when they would refuse it. |
 
-Exit code `2` also means a live run stopped for one of those reasons. The summary field is `infra_error_code` (`resource_exhausted_disk`, `resource_exhausted_memory`, `resource_exhausted_memory_pressure`, `infra_nospace`, `infra_memory`, `infra_ldap_userid`, `infra_apptainer_start`). An empty or bad patch is not one of these codes; accept and rollback stay on the controller.
+Exit code `2` also means a live run stopped for one of those reasons. The summary field is `infra_error_code` (`resource_exhausted_disk`, `resource_exhausted_memory`, `resource_exhausted_memory_pressure`, `infra_nospace`, `infra_memory`, `infra_ldap_userid`, `infra_apptainer_start`). An empty or bad patch is not one of these codes.
 
 Each sandbox directory under `APPTAINER_WORKSPACE_ROOT` (default `$TMPDIR/apptainer-workspaces`) gets a `.dgm-workspace-owner` marker for that output directory. At the end of a generation the run deletes only directories with its own marker. Unmarked directories and other owners stay, including other users and a second arm of the same experiment.
 
 ```bash
-python3 EvoPilot_outer.py --dry-resource-check
 python3 DGM_outer.py --dry-resource-check --polyglot
 ```
 

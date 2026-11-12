@@ -261,11 +261,7 @@ def self_improve(
     # Run baseline
     run_baseline=None,
     polyglot=False,
-    # Optional hooks for EvoPilot_outer. DGM_outer does not pass these.
-    problem_statement_override=None,
-    problem_statement_suffix=None,
-    evopilot_role=None,
-):  
+):
 
     global dataset
 
@@ -278,8 +274,6 @@ def self_improve(
     os.makedirs(output_dir, exist_ok=True)
     metadata['run_id'] = run_id
     metadata['parent_commit'] = parent_commit
-    if evopilot_role:
-        metadata['evopilot_role'] = evopilot_role
     test_task_list_big = load_json_file("./swe_bench/subsets/big.json")
 
     # Set up logger
@@ -376,12 +370,8 @@ def self_improve(
     exec_result = container.exec_run("python -m pip install -r /dgm/requirements.txt", workdir='/')
     log_container_output(exec_result)
 
-    # Get tasks to improve. An override skips the extra diagnose call so a
-    # recovery debug can pass evidence already collected by the controller.
-    if problem_statement_override:
-        safe_log("Using problem_statement override")
-        problem_statement = problem_statement_override
-    elif entry:
+    # Get tasks to improve
+    if entry:
         safe_log(f"Task to improve: {entry}")
         problem_statement = diagnose_problem(entry, parent_commit, root_dir, out_dir_base, patch_files=patch_files, polyglot=polyglot)
         safe_log(f"problem_statement: {problem_statement}")
@@ -390,14 +380,6 @@ def self_improve(
         cleanup_container(container)
         save_metadata(metadata, output_dir)
         return metadata
-
-    if problem_statement_suffix and problem_statement and not problem_statement_override:
-        problem_statement = (
-            problem_statement.rstrip()
-            + "\n\n"
-            + str(problem_statement_suffix).strip()
-            + "\n"
-        )
 
     metadata['entry'] = entry
     metadata['problem_statement'] = problem_statement

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -9,9 +10,6 @@ from pathlib import Path
 import pytest
 
 import DGM_outer
-import EvoPilot_outer
-from EvoPilot_outer import main, parse_args, run_live
-from evopilot.types import AgentSnapshot
 from utils.apptainer_compat import ApptainerClient
 from utils.host_resources import (
     DISK_CODE,
@@ -22,12 +20,12 @@ from utils.host_resources import (
     PRESSURE_CODE,
     ResourceGateError,
     ResourceSnapshot,
+    add_resource_arguments,
     apply_infra_metadata,
     assess_resources,
     classify_infra_error,
     cleanup_owned_workspaces,
     raise_for_infra_results,
-    stamp_workspace,
     stop_reason_for_infra,
     thresholds_from_args,
     verify_worker_block,
@@ -46,8 +44,14 @@ def _snapshot(*, free=_GIB, mem=8 * _GIB, pressure=0.0, paths=None):
     )
 
 
+def _thresholds(argv=()):
+    parser = argparse.ArgumentParser()
+    add_resource_arguments(parser)
+    return thresholds_from_args(parser.parse_args(list(argv)))
+
+
 def test_low_tmp_and_pressure_are_distinct_from_a_bad_patch():
-    thresholds = thresholds_from_args(parse_args([]))
+    thresholds = _thresholds()
     code, detail = assess_resources(thresholds, _snapshot(free=1024))
     assert code == DISK_CODE
     assert "/tmp" in detail
@@ -64,7 +68,7 @@ def test_low_tmp_and_pressure_are_distinct_from_a_bad_patch():
     assert healthy is None
     assert detail == "ok"
 
-    disabled = thresholds_from_args(parse_args(["--min-tmp-free-gb", "0", "--min-available-mem-gb", "0", "--max-mem-pressure", "-1"]))
+    disabled = _thresholds(["--min-tmp-free-gb", "0", "--min-available-mem-gb", "0", "--max-mem-pressure", "-1"])
     assert assess_resources(disabled, _snapshot(free=1, mem=1, pressure=99))[0] is None
 
 
@@ -232,156 +236,6 @@ def test_verify_gate_runs_before_the_polyglot_harness(monkeypatch, tmp_path):
     assert caught.value.code == DISK_CODE
 
 
-def _live_args(tmp_path, extra=None):
-    argv = [
-        "--benchmark",
-        "polyglot",
-        "--shallow_eval",
-        "--max_generation",
-        "3",
-        "--output_dir",
-        str(tmp_path),
-    ]
-    if extra:
-        argv.extend(extra)
-    return parse_args(argv)
-
-
-def _install_live_fakes(monkeypatch, tmp_path, improve):
-    monkeypatch.setattr("EvoPilot_outer.load_task_lists", lambda _benchmark: (["go__poker"], ["go__poker"]))
-    monkeypatch.setattr("EvoPilot_outer.prepare_initial_copy", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        "EvoPilot_outer.snapshot_from_initial_metadata",
-        lambda *_args, **_kwargs: AgentSnapshot(
-            agent_id="initial",
-            parent_id=None,
-            score=1.0,
-            step=0,
-            resolved_ids=("go__poker",),
-            root=True,
-        ),
-    )
-    monkeypatch.setattr("utils.container_runtime.resolve_container_runtime", lambda: "apptainer")
-    monkeypatch.setattr("EvoPilot_outer.call_self_improve", improve)
-    root = tmp_path / "workspaces"
-    root.mkdir()
-    monkeypatch.setenv("APPTAINER_WORKSPACE_ROOT", str(root))
-    return root
-
-
-def _regression_metadata(run_id="child"):
-    return {
-        "run_id": run_id,
-        "parent_commit": "initial",
-        "entry": "go__poker",
-        "model_patch_notempty": True,
-        "overall_performance": {
-            "accuracy_score": 0.0,
-            "total_submitted_instances": 1,
-            "total_resolved_ids": [],
-            "total_unresolved_ids": ["go__poker"],
-            "total_emptypatch_ids": [],
-        },
-    }
-
-
-def test_evopilot_low_tmp_does_not_call_self_improve(monkeypatch, tmp_path):
-    calls = []
-
-    def improve(**kwargs):
-        calls.append(kwargs)
-        return _regression_metadata()
-
-    _install_live_fakes(monkeypatch, tmp_path, improve)
-
-    def deny(thresholds=None, *, phase, probe=None):
-        raise ResourceGateError(
-            DISK_CODE,
-            "refusing improve: /tmp has 1 MiB free. No model call and no new Apptainer sandbox will be started.",
-            None,
-        )
-
-    monkeypatch.setattr("EvoPilot_outer.require_resources", deny)
-    summary = run_live(_live_args(tmp_path), str(tmp_path))
-    assert calls == []
-    assert summary["infra_error_code"] == DISK_CODE
-    assert "No model call" in summary["stop_reason"]
-    stored = json.loads((tmp_path / "evopilot_summary.json").read_text(encoding="utf-8"))
-    assert stored["infra_error_code"] == DISK_CODE
-    assert summary["decisions"] == []
-
-
-def test_evopilot_infra_verify_stops_before_the_next_improve(monkeypatch, tmp_path):
-    calls = []
-    root = None
-
-    def improve(**kwargs):
-        calls.append(kwargs["evopilot_role"])
-        owned = root / f"dgm-container-{len(calls)}"
-        owned.mkdir()
-        stamp_workspace(owned, name=owned.name)
-        foreign = root / "other-user"
-        foreign.mkdir(exist_ok=True)
-        (foreign / ".dgm-workspace-owner").write_text("owner=someone-else\n", encoding="utf-8")
-        return apply_infra_metadata(
-            {"run_id": f"child-{len(calls)}", "entry": "go__poker", "model_patch_notempty": False, "overall_performance": {}},
-            INFRA_NOSPACE,
-            "OSError: [Errno 28] No space left on device",
-        )
-
-    root = _install_live_fakes(monkeypatch, tmp_path, improve)
-    monkeypatch.setattr("EvoPilot_outer.require_resources", lambda *args, **kwargs: None)
-    summary = run_live(_live_args(tmp_path), str(tmp_path))
-    assert calls == ["improve"]
-    assert summary["infra_error_code"] == INFRA_NOSPACE
-    assert summary["decisions"] == ["rollback"]
-    assert not (root / "dgm-container-1").exists()
-    assert (root / "other-user").is_dir()
-
-
-def test_evopilot_continue_flag_skips_debug_but_tries_later_generations(monkeypatch, tmp_path):
-    calls = []
-
-    def improve(**kwargs):
-        calls.append(kwargs["evopilot_role"])
-        return apply_infra_metadata(
-            {"run_id": f"child-{len(calls)}", "entry": "go__poker", "model_patch_notempty": False, "overall_performance": {}},
-            INFRA_LDAP,
-            "FATAL: failed to get user id: unknown userid 1000",
-        )
-
-    _install_live_fakes(monkeypatch, tmp_path, improve)
-    monkeypatch.setattr("EvoPilot_outer.require_resources", lambda *args, **kwargs: None)
-    summary = run_live(_live_args(tmp_path, ["--continue-on-infra-error"]), str(tmp_path))
-    assert calls == ["improve", "improve", "improve"]
-    assert summary["infra_error_code"] is None
-    assert summary["decisions"] == ["rollback", "rollback", "rollback"]
-
-
-def test_evopilot_bad_patch_still_rolls_back_and_continues(monkeypatch, tmp_path):
-    calls = []
-    root = None
-
-    def improve(**kwargs):
-        calls.append(kwargs["evopilot_role"])
-        owned = root / "dgm-container-live"
-        if owned.exists():
-            owned.mkdir()
-        else:
-            owned.mkdir()
-        stamp_workspace(owned, name="dgm-container-live")
-        return _regression_metadata(f"child-{len(calls)}")
-
-    root = _install_live_fakes(monkeypatch, tmp_path, improve)
-    monkeypatch.setattr("EvoPilot_outer.require_resources", lambda *args, **kwargs: None)
-    summary = run_live(_live_args(tmp_path), str(tmp_path))
-    assert calls == ["improve", "improve", "improve"]
-    assert summary["infra_error_code"] is None
-    assert summary["stop_reason"] is None
-    assert summary["decisions"] == ["rollback", "rollback", "rollback"]
-    assert not (root / "dgm-container-live").exists()
-
-
 def test_dry_resource_check_does_not_start_a_run(monkeypatch):
     def low():
         return _snapshot(free=1024)
@@ -391,11 +245,12 @@ def test_dry_resource_check_does_not_start_a_run(monkeypatch):
     def forbid(*_args, **_kwargs):
         raise AssertionError("live run should not start")
 
-    monkeypatch.setattr("EvoPilot_outer.run_live", forbid)
-    monkeypatch.setattr("EvoPilot_outer.run_smoke", forbid)
-    code = main(["--dry-resource-check", "--min-tmp-free-gb", "10"])
+    monkeypatch.setattr(DGM_outer, "initialize_run", forbid)
+    code = DGM_outer.main(["--polyglot", "--dry-resource-check", "--min-tmp-free-gb", "10"])
     assert code == 2
-    code = main(["--dry-resource-check", "--min-tmp-free-gb", "0", "--min-available-mem-gb", "0", "--max-mem-pressure", "-1"])
+    code = DGM_outer.main(
+        ["--polyglot", "--dry-resource-check", "--min-tmp-free-gb", "0", "--min-available-mem-gb", "0", "--max-mem-pressure", "-1"]
+    )
     assert code == 0
 
 

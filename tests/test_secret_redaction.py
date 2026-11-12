@@ -1,17 +1,13 @@
-"""Secret values must not survive in logs or saved EvoPilot errors."""
+"""Secret values must not survive in logs or saved errors."""
 
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from DGM_outer import log_selfimprove_failure
-from EvoPilot_outer import failure_metadata
-from evopilot.evidence import evidence_from_dgm_metadata
-from evopilot.types import AgentSnapshot
 from utils.docker_utils import get_thread_logger, safe_log, setup_logger
 from utils.secret_redaction import redact_secrets
 
@@ -122,39 +118,3 @@ def test_swe_safe_log_redacts_secrets(tmp_path):
     swe_safe_log(f"harness failed: {RAW}")
     text = _read_log(logger, log_path)
     _assert_redacted(text)
-
-
-def test_evopilot_saved_error_redacts_secrets():
-    try:
-        raise subprocess.CalledProcessError(
-            1,
-            [
-                "apptainer",
-                "--env",
-                f"OPENAI_API_KEY={OPENAI}",
-                "--env",
-                f"OPENROUTER_API_KEY={OPENROUTER}",
-                "--env",
-                f"OPENAI_BASE_URL={BASE_URL}",
-            ],
-        )
-    except subprocess.CalledProcessError as exc:
-        metadata = failure_metadata("initial", "go__poker", exc)
-    blob = json.dumps(metadata)
-    assert OPENAI not in blob
-    assert OPENROUTER not in blob
-    assert BASE_URL in blob
-    assert metadata["evopilot_failure_cluster"] == "infrastructure_error"
-
-    base = AgentSnapshot(agent_id="initial", parent_id=None, score=0.4, step=0, root=True)
-    evidence = evidence_from_dgm_metadata(
-        {
-            "run_id": "failed-1",
-            "entry": "go__poker",
-            "model_patch_notempty": False,
-            "error": RAW,
-            "overall_performance": {},
-        },
-        base=base,
-    )
-    _assert_redacted(evidence.notes)
