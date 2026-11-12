@@ -250,7 +250,7 @@ def load_split_screen(split_path):
     medium.json. EvoPilot's default split (layout "screen") is that same screen:
     bucket 1 is small.json and the other buckets are the rest of medium.json, so
     DGM runs its own protocol, less the one medium problem already in small.json.
-    The buckets never include a held-out (or diagnosis-pool) problem, and the two
+    The buckets never include a held-out problem, and the two
     stages do not overlap, so every evaluation problem counts once. Parent selection and
     the problem a diagnosis reads use the first stage, as upstream.
     """
@@ -262,10 +262,10 @@ def load_split_screen(split_path):
         raise RuntimeError(f"{split_path} needs at least two evaluation buckets for DGM's two stages.")
     first = buckets[0]
     rest = [instance_id for bucket in buckets[1:] for instance_id in bucket]
-    held = set(split.get("heldout") or ()) | set(split.get("diagnosis_pool") or ())
+    held = set(split.get("heldout") or ())
     leaked = sorted(held & set(first + rest))
     if leaked:
-        raise RuntimeError(f"{split_path}: evaluation buckets overlap held-out or pool problems ({', '.join(leaked[:3])}).")
+        raise RuntimeError(f"{split_path}: evaluation buckets overlap held-out problems ({', '.join(leaked[:3])}).")
     return first, rest
 
 

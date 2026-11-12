@@ -21,7 +21,6 @@ import sync_runtime  # noqa: E402
 
 BUCKETS = [["go__a", "py__b"], ["rs__c", "go__d"], ["py__e"]]
 HELDOUT = ["go__h"]
-POOL = ["py__p"]
 
 
 def git(repo, *args):
@@ -110,7 +109,7 @@ def write_calibration(tmp_path):
 
 def write_split(tmp_path, buckets=BUCKETS):
     split = tmp_path / "split.json"
-    split.write_text(json.dumps({"eval_buckets": buckets, "heldout": HELDOUT, "diagnosis_pool": POOL}))
+    split.write_text(json.dumps({"eval_buckets": buckets, "heldout": HELDOUT}))
     return split
 
 
@@ -216,6 +215,6 @@ def test_default_split_is_dgms_own_screen(tmp_path):
     rest = [i for i in medium if i not in small]
     buckets = [small] + [rest[k:k + 10] for k in range(0, len(rest), 10)]
     split = tmp_path / "split.json"
-    split.write_text(json.dumps({"eval_buckets": buckets, "heldout": ["go__outside"], "diagnosis_pool": []}))
+    split.write_text(json.dumps({"eval_buckets": buckets, "heldout": ["go__outside"]}))
     first, second = load_split_screen(str(split))
     assert first == small and sorted(second) == sorted(rest) and len(second) == 49

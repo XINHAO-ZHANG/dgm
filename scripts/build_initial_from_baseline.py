@@ -14,8 +14,7 @@ every child is scored on, and ``overall_performance_deep`` covers all buckets.
 With several baseline runs per problem, ``accuracy_score`` is passes over runs
 and a problem counts as resolved when at least half of its runs passed, as in
 EvoPilot's bucket baseline. One failing run of each unresolved problem is copied
-into ``predictions/`` for DGM's diagnosis. Held-out and diagnosis-pool problems
-are not read.
+into ``predictions/`` for DGM's diagnosis. Held-out problems are not read.
 
     python scripts/build_initial_from_baseline.py --split split.json \\
         --baseline <calibration dir> [--baseline ...] --out initial_polyglot_qwen
