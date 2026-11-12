@@ -204,3 +204,18 @@ def test_dgm_under_the_split_scores_children_on_the_buckets(monkeypatch, tmp_pat
     assert call["parent_commit"] == "initial" and call["entry"] == "py__b"
     copied = list((tmp_path / "output_dgm").glob("*/initial/metadata.json"))
     assert copied and json.loads(copied[0].read_text())["overall_performance"]["total_unresolved_ids"] == ["py__b"]
+
+
+def test_default_split_is_dgms_own_screen(tmp_path):
+    """EvoPilot's screen layout: bucket 1 is small.json, the other buckets the rest of medium.json."""
+    import json
+    from DGM_outer import load_split_screen
+
+    small = json.load(open("polyglot/subsets/small.json"))
+    medium = json.load(open("polyglot/subsets/medium.json"))
+    rest = [i for i in medium if i not in small]
+    buckets = [small] + [rest[k:k + 10] for k in range(0, len(rest), 10)]
+    split = tmp_path / "split.json"
+    split.write_text(json.dumps({"eval_buckets": buckets, "heldout": ["go__outside"], "diagnosis_pool": []}))
+    first, second = load_split_screen(str(split))
+    assert first == small and sorted(second) == sorted(rest) and len(second) == 49

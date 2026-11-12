@@ -7,7 +7,8 @@ was made with claude-3-5-sonnet on the full benchmark; the aligned baseline uses
 qwen and EvoPilot's split, so it needs the same baseline EvoPilot starts from.
 
 Under the split DGM keeps its staged screen on the evaluation problems: bucket 1
-plays ``small.json`` and buckets 2-5 the second stage (DGM_outer.py --split). The
+is ``small.json`` and the other buckets the second stage (DGM_outer.py --split);
+in EvoPilot's default split they are the rest of ``medium.json``. The
 initial agent's ``overall_performance`` therefore covers bucket 1, the problems
 every child is scored on, and ``overall_performance_deep`` covers all buckets.
 With several baseline runs per problem, ``accuracy_score`` is passes over runs

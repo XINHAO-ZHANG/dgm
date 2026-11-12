@@ -33,16 +33,23 @@ The model is `qwen/qwen3-coder-flash` in both (`llm.py`).
 
 ## Problems
 
-Under `--split`, DGM uses EvoPilot's split file:
+Both methods evolve on DGM's own screen, the problems DGM and HGM report on.
+EvoPilot's default split (`scripts/partition_problems.py`, layout `screen`) keeps it as
+it is, and DGM reads it with `--split`:
 
-- Bucket 1 (10 problems) plays `small.json`; every child is scored on it, and parent
+- Bucket 1 is `small.json` (10 problems); every child is scored on it, and parent
   selection and the diagnosis problem use that score and its unresolved problems,
   as upstream.
-- A child that resolves at least 40% of bucket 1 also runs buckets 2-5 (40 problems),
-  which plays `medium.json`; that result is `overall_performance_deep`, as upstream.
-  The two stages do not overlap.
-- Held-out and diagnosis-pool problems are never run or read. Both methods report on
-  the held-out set at the end.
+- A child that resolves at least 40% of bucket 1 also runs the other buckets, the
+  rest of `medium.json` (49 problems; the one `medium.json` problem already in
+  `small.json` is not run twice); that result is `overall_performance_deep`, as
+  upstream.
+- The held-out set (40 problems by default) comes from outside the screen. Neither
+  method runs or reads it while evolving; both report on it at the end.
+
+EvoPilot measures the same 59 problems differently (a paired comparison with its
+active agent, one bucket at a time) and diagnoses one failing training problem, as
+DGM does; its diagnosis also sees a short history of earlier edits.
 
 The initial agent's cache comes from the same qwen baseline as EvoPilot's
 (`scripts/build_initial_from_baseline.py`), not from `initial_polyglot/`, which was

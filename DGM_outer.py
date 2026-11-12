@@ -244,12 +244,14 @@ def get_full_eval_threshold(output_dir, archive):
     return threshold
 
 def load_split_screen(split_path):
-    """DGM's two-stage screen on EvoPilot's split: bucket 1, then buckets 2-5.
+    """DGM's two-stage screen on EvoPilot's split: bucket 1, then the other buckets.
 
     Upstream DGM scores every child on small.json and, past the 40% gate, on
-    medium.json. Under the split the same stages run on the evaluation buckets,
-    which never include a held-out or diagnosis-pool problem. The two stages do
-    not overlap, so every evaluation problem counts once. Parent selection and
+    medium.json. EvoPilot's default split (layout "screen") is that same screen:
+    bucket 1 is small.json and the other buckets are the rest of medium.json, so
+    DGM runs its own protocol, less the one medium problem already in small.json.
+    The buckets never include a held-out (or diagnosis-pool) problem, and the two
+    stages do not overlap, so every evaluation problem counts once. Parent selection and
     the problem a diagnosis reads use the first stage, as upstream.
     """
 
@@ -315,7 +317,7 @@ def main(argv=None):
     # Alignment with EvoPilot (Polyglot only); see ALIGNMENT.md.
     parser.add_argument(
         "--split", type=str, default=None,
-        help="EvoPilot split file: evaluate on its buckets (bucket 1, then 2-5) instead of small/medium.json. "
+        help="EvoPilot split file: evaluate on its buckets (bucket 1, then the rest) instead of small/medium.json. "
              "Needs a runtime synced from EvoPilot and an initial cache built from the same split.",
     )
     parser.add_argument(
